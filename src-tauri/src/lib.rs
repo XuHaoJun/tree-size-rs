@@ -4,6 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs; // 替换标准库 fs
+use kanal;
+
+/// Represents size information for a file or directory
+#[derive(Clone, Debug)]
+struct FileSystemEntry {
+    /// Path to the file or directory
+    path: PathBuf,
+    /// Size in bytes
+    size_bytes: u64,
+}
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -22,9 +32,24 @@ async fn run_tree_size(path: String) -> std::io::Result<()> {
         size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
     }
 
-    calculate_size_async(target_dir, size_map.clone()).await?;
+    // Create a channel with capacity 100 for sending file system entries
+    let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
+    
+    // Spawn a task to process received entries
+    let receiver_handle = tokio::spawn(async move {
+        while let Ok(entry) = receiver.recv() {
+            println!("Path: {}, Size: {} bytes", entry.path.display(), entry.size_bytes);
+        }
+    });
 
-    // 输出逻辑保持不变...
+    calculate_size_async(target_dir, size_map.clone(), Some(sender)).await?;
+    
+    // Close the channel
+    // The sender will be dropped after the calculation is done
+
+    // Wait for receiver task to complete
+    let _ = receiver_handle.await;
+
     Ok(())
 }
 
@@ -32,6 +57,7 @@ async fn run_tree_size(path: String) -> std::io::Result<()> {
 async fn calculate_size_async(
     path: PathBuf,
     size_map: Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
+    sender: Option<kanal::Sender<FileSystemEntry>>,
 ) -> std::io::Result<()> {
     if path.is_symlink() {
         return Ok(());
@@ -50,7 +76,7 @@ async fn calculate_size_async(
     if metadata.is_dir() {
         match size_map.entry(path.clone()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
-                updates.push((e.get().clone(), self_size, path.clone()))
+                updates.push((e.get().clone(), self_size, path.clone()));
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 let counter = Arc::new(AtomicU64::new(self_size));
@@ -66,7 +92,14 @@ async fn calculate_size_async(
         if let Some(counter) = size_map.get(parent) {
             counter.fetch_add(self_size, Ordering::Relaxed);
             let value = counter.load(Ordering::Relaxed);
-            println!("parent: {}, value: {}", parent.display(), value);
+            
+            // Send parent path and value to channel if available
+            if let Some(sender) = &sender {
+                let _ = sender.send(FileSystemEntry {
+                    path: parent.clone(),
+                    size_bytes: value,
+                });
+            }
         }
     });
 
@@ -74,7 +107,14 @@ async fn calculate_size_async(
     for (counter, size, path) in updates {
         counter.fetch_add(size, Ordering::Relaxed);
         let value = counter.load(Ordering::Relaxed);
-        println!("{}: {}", path.display(), value);
+        
+        // Send path and value to channel if available
+        if let Some(sender) = &sender {
+            let _ = sender.send(FileSystemEntry {
+                path: path,
+                size_bytes: value,
+            });
+        }
     }
 
     // 异步处理子目录
@@ -94,11 +134,12 @@ async fn calculate_size_async(
                 // 注意：这里需要使用 tokio::runtime::Handle 来运行异步任务
                 let size_map_clone = size_map.clone();
                 let child_path_clone = child_path.clone();
+                let sender_clone = sender.clone();
 
                 // 创建一个同步的阻塞任务，内部运行异步代码
                 tokio::task::block_in_place(|| {
                     let rt = tokio::runtime::Handle::current();
-                    rt.block_on(calculate_size_async(child_path_clone, size_map_clone))
+                    rt.block_on(calculate_size_async(child_path_clone, size_map_clone, sender_clone))
                 })
             })
             .collect();

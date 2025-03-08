@@ -35,3 +35,4 @@ serde_json = "1"
 dashmap = "6"
 tokio = { version = "1", features = ["fs", "io-std"] }
 rayon = "1"
+kanal = "0.1.0-pre8"
