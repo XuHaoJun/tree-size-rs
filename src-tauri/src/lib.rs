@@ -1,11 +1,11 @@
 use dashmap::DashMap;
+use kanal;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::fs;
-use kanal;
 use tauri::Emitter;
-use serde::Serialize;
+use tokio::fs;
 
 /// Represents size information for a file or directory
 #[derive(Clone, Debug, Serialize)]
@@ -16,53 +16,12 @@ struct FileSystemEntry {
     size_bytes: u64,
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-async fn print_tree_size(path: &str) -> Result<String, ()> {
-    let _ = run_tree_size(path.to_string()).await;
-    Ok(format!("Hello, {}! You've been greeted from Rust!", path))
-}
-
-async fn run_tree_size(path: String) -> std::io::Result<()> {
-    let target_dir = Path::new(&path).canonicalize()?;
-    let size_map = Arc::new(DashMap::new());
-
-    // 异步预热父目录链
-    // let path_chain = get_parent_chain(&target_dir).await;
-    // for p in path_chain {
-    //     size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
-    // }
-
-    // Create a channel with capacity 100 for sending file system entries
-    let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
-    
-    // Spawn a task to process received entries
-    let receiver_handle = tokio::spawn(async move {
-        while let Ok(entry) = receiver.recv() {
-            println!("Path: {}, Size: {} bytes", entry.path.display(), entry.size_bytes);
-        }
-    });
-
-    // Run the calculate_size_async function in the current task
-    let calc_task = tokio::spawn(calculate_size_async(target_dir, size_map.clone(), Some(sender)));
-    
-    // Wait for calculation to complete and handle any errors
-    if let Err(e) = calc_task.await? {
-        eprintln!("Error during directory calculation: {}", e);
-        return Err(e);
-    }
-    
-    // Wait for receiver task to complete
-    let _ = receiver_handle.await;
-
-    Ok(())
-}
-
 // Asynchronous recursive processing function
 async fn calculate_size_async(
     path: PathBuf,
     size_map: Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
     sender: Option<kanal::Sender<FileSystemEntry>>,
+    target_dir_path: Option<PathBuf>,
 ) -> std::io::Result<()> {
     if path.is_symlink() {
         return Ok(());
@@ -75,6 +34,7 @@ async fn calculate_size_async(
     };
 
     let self_size = metadata.len();
+    println!("path: {}, bytes: {}", path.display(), self_size);
 
     // Handle updates directly
     let mut updates = vec![];
@@ -89,7 +49,14 @@ async fn calculate_size_async(
                 e.insert(counter);
             }
         }
+    }
+    // Skip parent size calculation if this is the target directory
+    let is_target_dir = match &target_dir_path {
+        Some(target) => path == *target,
+        None => false,
+    };
 
+    if !is_target_dir {
         // Update parent directories
         let parent_chain = get_parent_chain_sync(&path);
         for parent in parent_chain {
@@ -97,7 +64,7 @@ async fn calculate_size_async(
             if let Some(counter) = size_map.get(&parent) {
                 counter.fetch_add(self_size, Ordering::Relaxed);
                 let value = counter.load(Ordering::Relaxed);
-                
+
                 // Send parent path and value to channel if available
                 if let Some(sender) = &sender {
                     let _ = sender.send(FileSystemEntry {
@@ -113,7 +80,7 @@ async fn calculate_size_async(
     for (counter, size, path) in updates {
         counter.fetch_add(size, Ordering::Relaxed);
         let value = counter.load(Ordering::Relaxed);
-        
+
         // Send path and value to channel if available
         if let Some(sender) = &sender {
             let _ = sender.send(FileSystemEntry {
@@ -139,7 +106,8 @@ async fn calculate_size_async(
             let future = Box::pin(calculate_size_async(
                 child_path,
                 size_map.clone(),
-                sender.clone()
+                sender.clone(),
+                target_dir_path.clone(),
             ));
             future.await?;
         }
@@ -178,14 +146,14 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
     let size_map = Arc::new(DashMap::new());
 
     // Warm up parent directory chain
-    let path_chain = get_parent_chain(&target_dir).await;
-    for p in path_chain {
-        size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
-    }
+    // let path_chain = get_parent_chain(&target_dir).await;
+    // for p in path_chain {
+    //     size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
+    // }
 
     // Create a channel with capacity 100 for sending file system entries
     let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
-    
+
     // Spawn a task to process received entries and emit them as Tauri events
     let window_clone = window.clone();
     let receiver_handle = tokio::spawn(async move {
@@ -195,7 +163,7 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
                 eprintln!("Failed to emit event: {}", e);
             }
         }
-        
+
         // Emit a completion event when done
         if let Err(e) = window_clone.emit("scan-complete", ()) {
             eprintln!("Failed to emit completion event: {}", e);
@@ -203,14 +171,19 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
     });
 
     // Run the calculate_size_async function in a separate task
-    let calc_task = tokio::spawn(calculate_size_async(target_dir, size_map.clone(), Some(sender)));
-    
+    let calc_task = tokio::spawn(calculate_size_async(
+        target_dir.clone(),
+        size_map.clone(),
+        Some(sender),
+        Some(target_dir),
+    ));
+
     // Wait for calculation to complete and handle any errors
     if let Err(e) = calc_task.await? {
         eprintln!("Error during directory calculation: {}", e);
         return Err(e);
     }
-    
+
     // Wait for receiver task to complete
     let _ = receiver_handle.await;
 
@@ -220,18 +193,17 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Create a multi-threaded Tokio runtime
-    let runtime = tokio::runtime::Runtime::new()
-        .expect("Failed to create Tokio runtime");
-    
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
     // Set the runtime as the default for this thread
     let _guard = runtime.enter();
-    
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![print_tree_size, scan_directory_size])
+        .invoke_handler(tauri::generate_handler![scan_directory_size])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

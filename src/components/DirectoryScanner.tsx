@@ -33,9 +33,21 @@ export function DirectoryScanner() {
     const setupListeners = async () => {
       unlistenEntry = listen<FileSystemEntry>("directory-entry", (event: EventPayload<FileSystemEntry>) => {
         setEntries((prevEntries) => {
-          const newEntries = [...prevEntries, event.payload];
-          // Sort entries when a new one is received
-          return sortEntries(newEntries, sortOrder);
+          const newEntry = event.payload;
+          const existingEntryIndex = prevEntries.findIndex(entry => entry.path === newEntry.path);
+          
+          let updatedEntries;
+          if (existingEntryIndex >= 0) {
+            // Update existing entry
+            updatedEntries = [...prevEntries];
+            updatedEntries[existingEntryIndex] = newEntry;
+          } else {
+            // Add new entry
+            updatedEntries = [...prevEntries, newEntry];
+          }
+          
+          // Sort entries
+          return sortEntries(updatedEntries, sortOrder);
         });
       });
 
