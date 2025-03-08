@@ -1,13 +1,14 @@
 use dashmap::DashMap;
-use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::fs; // 替换标准库 fs
+use tokio::fs;
 use kanal;
+use tauri::Emitter;
+use serde::Serialize;
 
 /// Represents size information for a file or directory
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct FileSystemEntry {
     /// Path to the file or directory
     path: PathBuf,
@@ -27,10 +28,10 @@ async fn run_tree_size(path: String) -> std::io::Result<()> {
     let size_map = Arc::new(DashMap::new());
 
     // 异步预热父目录链
-    let path_chain = get_parent_chain(&target_dir).await;
-    for p in path_chain {
-        size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
-    }
+    // let path_chain = get_parent_chain(&target_dir).await;
+    // for p in path_chain {
+    //     size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
+    // }
 
     // Create a channel with capacity 100 for sending file system entries
     let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
@@ -42,18 +43,22 @@ async fn run_tree_size(path: String) -> std::io::Result<()> {
         }
     });
 
-    calculate_size_async(target_dir, size_map.clone(), Some(sender)).await?;
+    // Run the calculate_size_async function in the current task
+    let calc_task = tokio::spawn(calculate_size_async(target_dir, size_map.clone(), Some(sender)));
     
-    // Close the channel
-    // The sender will be dropped after the calculation is done
-
+    // Wait for calculation to complete and handle any errors
+    if let Err(e) = calc_task.await? {
+        eprintln!("Error during directory calculation: {}", e);
+        return Err(e);
+    }
+    
     // Wait for receiver task to complete
     let _ = receiver_handle.await;
 
     Ok(())
 }
 
-// 异步递归处理函数
+// Asynchronous recursive processing function
 async fn calculate_size_async(
     path: PathBuf,
     size_map: Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
@@ -63,7 +68,7 @@ async fn calculate_size_async(
         return Ok(());
     }
 
-    // 异步获取元数据
+    // Asynchronously get metadata
     let metadata = match fs::metadata(&path).await {
         Ok(m) => m,
         Err(_) => return Ok(()),
@@ -71,7 +76,7 @@ async fn calculate_size_async(
 
     let self_size = metadata.len();
 
-    // 移除 thread_local! 代码块，直接处理更新
+    // Handle updates directly
     let mut updates = vec![];
     if metadata.is_dir() {
         match size_map.entry(path.clone()) {
@@ -84,26 +89,27 @@ async fn calculate_size_async(
                 e.insert(counter);
             }
         }
-    }
 
-    // 父目录链更新 - 使用 Rayon 并行处理
-    let parent_chain = get_parent_chain_sync(&path);
-    parent_chain.par_iter().for_each(|parent| {
-        if let Some(counter) = size_map.get(parent) {
-            counter.fetch_add(self_size, Ordering::Relaxed);
-            let value = counter.load(Ordering::Relaxed);
-            
-            // Send parent path and value to channel if available
-            if let Some(sender) = &sender {
-                let _ = sender.send(FileSystemEntry {
-                    path: parent.clone(),
-                    size_bytes: value,
-                });
+        // Update parent directories
+        let parent_chain = get_parent_chain_sync(&path);
+        for parent in parent_chain {
+            // Skip if parent is not in map
+            if let Some(counter) = size_map.get(&parent) {
+                counter.fetch_add(self_size, Ordering::Relaxed);
+                let value = counter.load(Ordering::Relaxed);
+                
+                // Send parent path and value to channel if available
+                if let Some(sender) = &sender {
+                    let _ = sender.send(FileSystemEntry {
+                        path: parent.clone(),
+                        size_bytes: value,
+                    });
+                }
             }
         }
-    });
+    }
 
-    // 直接处理更新，不使用 thread_local
+    // Process updates
     for (counter, size, path) in updates {
         counter.fetch_add(size, Ordering::Relaxed);
         let value = counter.load(Ordering::Relaxed);
@@ -117,36 +123,25 @@ async fn calculate_size_async(
         }
     }
 
-    // 异步处理子目录
+    // Process subdirectories asynchronously
     if metadata.is_dir() {
         let mut entries = Vec::new();
         let mut children = fs::read_dir(&path).await?;
 
-        // 收集所有子目录条目
+        // Collect all subdirectory entries
         while let Some(entry) = children.next_entry().await? {
             entries.push(entry.path());
         }
 
-        // 使用 Rayon 并行处理子目录
-        let results: Vec<std::io::Result<()>> = entries
-            .par_iter()
-            .map(|child_path| {
-                // 注意：这里需要使用 tokio::runtime::Handle 来运行异步任务
-                let size_map_clone = size_map.clone();
-                let child_path_clone = child_path.clone();
-                let sender_clone = sender.clone();
-
-                // 创建一个同步的阻塞任务，内部运行异步代码
-                tokio::task::block_in_place(|| {
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(calculate_size_async(child_path_clone, size_map_clone, sender_clone))
-                })
-            })
-            .collect();
-
-        // 检查结果中的错误
-        for result in results {
-            result?;
+        // Process each subdirectory sequentially but asynchronously
+        for child_path in entries {
+            // Use Box::pin to handle recursive async calls
+            let future = Box::pin(calculate_size_async(
+                child_path,
+                size_map.clone(),
+                sender.clone()
+            ));
+            future.await?;
         }
     }
 
@@ -169,11 +164,74 @@ async fn get_parent_chain(path: &Path) -> Vec<PathBuf> {
     get_parent_chain_sync(path)
 }
 
+// New command to stream directory sizes to the frontend
+#[tauri::command]
+async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), String> {
+    match scan_directory_with_events(path, window).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+async fn scan_directory_with_events(path: String, window: tauri::Window) -> std::io::Result<()> {
+    let target_dir = Path::new(&path).canonicalize()?;
+    let size_map = Arc::new(DashMap::new());
+
+    // Warm up parent directory chain
+    let path_chain = get_parent_chain(&target_dir).await;
+    for p in path_chain {
+        size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
+    }
+
+    // Create a channel with capacity 100 for sending file system entries
+    let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
+    
+    // Spawn a task to process received entries and emit them as Tauri events
+    let window_clone = window.clone();
+    let receiver_handle = tokio::spawn(async move {
+        while let Ok(entry) = receiver.recv() {
+            // Emit each file/directory entry as an event to the frontend
+            if let Err(e) = window_clone.emit("directory-entry", &entry) {
+                eprintln!("Failed to emit event: {}", e);
+            }
+        }
+        
+        // Emit a completion event when done
+        if let Err(e) = window_clone.emit("scan-complete", ()) {
+            eprintln!("Failed to emit completion event: {}", e);
+        }
+    });
+
+    // Run the calculate_size_async function in a separate task
+    let calc_task = tokio::spawn(calculate_size_async(target_dir, size_map.clone(), Some(sender)));
+    
+    // Wait for calculation to complete and handle any errors
+    if let Err(e) = calc_task.await? {
+        eprintln!("Error during directory calculation: {}", e);
+        return Err(e);
+    }
+    
+    // Wait for receiver task to complete
+    let _ = receiver_handle.await;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Create a multi-threaded Tokio runtime
+    let runtime = tokio::runtime::Runtime::new()
+        .expect("Failed to create Tokio runtime");
+    
+    // Set the runtime as the default for this thread
+    let _guard = runtime.enter();
+    
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![print_tree_size])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![print_tree_size, scan_directory_size])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
