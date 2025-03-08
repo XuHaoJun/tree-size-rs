@@ -34,7 +34,6 @@ async fn calculate_size_async(
     };
 
     let self_size = metadata.len();
-    println!("path: {}, bytes: {}", path.display(), self_size);
 
     // Handle updates directly
     let mut updates = vec![];
@@ -65,6 +64,8 @@ async fn calculate_size_async(
                 counter.fetch_add(self_size, Ordering::Relaxed);
                 let value = counter.load(Ordering::Relaxed);
 
+                // println!("path: {}, bytes: {}", parent.display(), value);
+
                 // Send parent path and value to channel if available
                 if let Some(sender) = &sender {
                     let _ = sender.send(FileSystemEntry {
@@ -80,6 +81,8 @@ async fn calculate_size_async(
     for (counter, size, path) in updates {
         counter.fetch_add(size, Ordering::Relaxed);
         let value = counter.load(Ordering::Relaxed);
+        
+        // println!("path: {}, bytes: {}", path.display(), value);
 
         // Send path and value to channel if available
         if let Some(sender) = &sender {
