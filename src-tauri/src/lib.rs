@@ -8,6 +8,31 @@ use tauri::Emitter;
 use tokio::fs;
 use dashmap::DashSet;
 
+/// Contains analytics information for a directory or file
+#[derive(Debug)]
+struct AnalyticsInfo {
+    /// Total size in bytes
+    size_bytes: AtomicU64,
+    /// Total number of entries (files and directories)
+    entry_count: AtomicU64,
+}
+
+impl AnalyticsInfo {
+    fn new() -> Self {
+        Self {
+            size_bytes: AtomicU64::new(0),
+            entry_count: AtomicU64::new(0),
+        }
+    }
+
+    fn new_with_size(size: u64) -> Self {
+        Self {
+            size_bytes: AtomicU64::new(size),
+            entry_count: AtomicU64::new(1), // Count itself as 1 entry
+        }
+    }
+}
+
 /// Represents size information for a file or directory
 #[derive(Clone, Debug, Serialize)]
 struct FileSystemEntry {
@@ -15,12 +40,14 @@ struct FileSystemEntry {
     path: PathBuf,
     /// Size in bytes
     size_bytes: u64,
+    /// Number of entries (files and directories)
+    entry_count: u64,
 }
 
 // Asynchronous recursive processing function
 async fn calculate_size_async(
     path: PathBuf,
-    size_map: Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
+    analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
     sender: Option<kanal::Sender<FileSystemEntry>>,
     target_dir_path: Option<PathBuf>,
     visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
@@ -30,7 +57,7 @@ async fn calculate_size_async(
         // Only count the symlink itself, not what it points to
         if let Ok(metadata) = fs::symlink_metadata(&path).await {
             let self_size = metadata.len();
-            update_size(&path, self_size, &size_map, &sender);
+            update_analytics(&path, self_size, 1, &analytics_map, &sender);
         }
         return Ok(());
     }
@@ -58,18 +85,20 @@ async fn calculate_size_async(
     }
 
     let self_size = metadata.len();
+    let is_dir = metadata.is_dir();
+    let entry_count = 1; // Count this file/directory as 1
 
     // Handle updates directly
     let mut updates = vec![];
-    if metadata.is_dir() {
-        match size_map.entry(path.clone()) {
+    if is_dir {
+        match analytics_map.entry(path.clone()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
-                updates.push((e.get().clone(), self_size, path.clone()));
+                updates.push((e.get().clone(), self_size, entry_count, path.clone()));
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                let counter = Arc::new(AtomicU64::new(self_size));
-                updates.push((counter.clone(), 0, path.clone()));
-                e.insert(counter);
+                let analytics = Arc::new(AnalyticsInfo::new_with_size(self_size));
+                updates.push((analytics.clone(), 0, 0, path.clone()));
+                e.insert(analytics);
             }
         }
     }
@@ -84,15 +113,16 @@ async fn calculate_size_async(
         let parent_chain = get_parent_chain_sync(&path);
         for parent in parent_chain {
             // Skip if parent is not in map
-            if let Some(counter) = size_map.get(&parent) {
-                counter.fetch_add(self_size, Ordering::Relaxed);
-                let value = counter.load(Ordering::Relaxed);
-
-                // Send parent path and value to channel if available
+            if let Some(analytics) = analytics_map.get(&parent) {
+                analytics.size_bytes.fetch_add(self_size, Ordering::Relaxed);
+                analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
+                
+                // Send parent path and values to channel if available
                 if let Some(sender) = &sender {
                     let _ = sender.send(FileSystemEntry {
                         path: parent.clone(),
-                        size_bytes: value,
+                        size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
+                        entry_count: analytics.entry_count.load(Ordering::Relaxed),
                     });
                 }
             }
@@ -100,21 +130,22 @@ async fn calculate_size_async(
     }
 
     // Process updates
-    for (counter, size, path) in updates {
-        counter.fetch_add(size, Ordering::Relaxed);
-        let value = counter.load(Ordering::Relaxed);
+    for (analytics, size, count, path) in updates {
+        analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
+        analytics.entry_count.fetch_add(count, Ordering::Relaxed);
         
-        // Send path and value to channel if available
+        // Send path and values to channel if available
         if let Some(sender) = &sender {
             let _ = sender.send(FileSystemEntry {
                 path: path,
-                size_bytes: value,
+                size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
+                entry_count: analytics.entry_count.load(Ordering::Relaxed),
             });
         }
     }
 
     // Process subdirectories asynchronously
-    if metadata.is_dir() {
+    if is_dir {
         let mut entries = Vec::new();
         let mut children = fs::read_dir(&path).await?;
 
@@ -131,7 +162,7 @@ async fn calculate_size_async(
             // Use Box::pin to handle recursive async calls
             let future = Box::pin(calculate_size_async(
                 child_path,
-                size_map.clone(),
+                analytics_map.clone(),
                 sender.clone(),
                 target_dir_path.clone(),
                 Some(visited.clone()),
@@ -143,22 +174,24 @@ async fn calculate_size_async(
     Ok(())
 }
 
-// Helper function to update size and send events
-fn update_size(
+// Helper function to update analytics and send events
+fn update_analytics(
     path: &Path, 
-    size: u64, 
-    size_map: &Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
+    size: u64,
+    count: u64,
+    analytics_map: &Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
     sender: &Option<kanal::Sender<FileSystemEntry>>
 ) {
-    if let Some(counter) = size_map.get(path) {
-        counter.fetch_add(size, Ordering::Relaxed);
-        let value = counter.load(Ordering::Relaxed);
+    if let Some(analytics) = analytics_map.get(path) {
+        analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
+        analytics.entry_count.fetch_add(count, Ordering::Relaxed);
         
-        // Send path and value to channel if available
+        // Send path and values to channel if available
         if let Some(sender) = sender {
             let _ = sender.send(FileSystemEntry {
                 path: path.to_path_buf(),
-                size_bytes: value,
+                size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
+                entry_count: analytics.entry_count.load(Ordering::Relaxed),
             });
         }
     }
@@ -191,7 +224,7 @@ async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), 
 
 async fn scan_directory_with_events(path: String, window: tauri::Window) -> std::io::Result<()> {
     let target_dir = Path::new(&path).canonicalize()?;
-    let size_map = Arc::new(DashMap::new());
+    let analytics_map = Arc::new(DashMap::new());
     // Initialize the set to track visited inodes (to prevent cycles)
     let visited_inodes = Arc::new(DashSet::new());
 
@@ -223,7 +256,7 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
     // Run the calculate_size_async function in a separate task
     let calc_task = tokio::spawn(calculate_size_async(
         target_dir.clone(),
-        size_map.clone(),
+        analytics_map.clone(),
         Some(sender),
         Some(target_dir),
         Some(visited_inodes),

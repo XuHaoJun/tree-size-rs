@@ -11,6 +11,7 @@ import { FixedSizeList } from "react-window";
 interface FileSystemEntry {
   path: string;
   size_bytes: number;
+  entry_count: number;
 }
 
 interface EventPayload<T> {
@@ -26,6 +27,7 @@ export function DirectoryScanner() {
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
+  const [sortBy, setSortBy] = useState<"size" | "count">("size");
   const [filterValue, setFilterValue] = useState("");
   const [listHeight, setListHeight] = useState(
     typeof window !== "undefined" ? Math.max(400, window.innerHeight - 400) : 400
@@ -96,7 +98,7 @@ export function DirectoryScanner() {
           });
 
           // Sort entries
-          const sortedEntries = sortEntries(updatedEntries, sortOrder);
+          const sortedEntries = sortEntries(updatedEntries, sortOrder, sortBy);
 
           // Clear the buffer
           entriesBuffer = [];
@@ -134,7 +136,7 @@ export function DirectoryScanner() {
               }
 
               // Sort entries
-              const sortedEntries = sortEntries(updatedEntries, sortOrder);
+              const sortedEntries = sortEntries(updatedEntries, sortOrder, sortBy);
 
               // Clear the buffer
               entriesBuffer = [];
@@ -182,7 +184,7 @@ export function DirectoryScanner() {
         unlistenComplete.then((unlisten) => unlisten());
       }
     };
-  }, [sortOrder]);
+  }, [sortOrder, sortBy]);
 
   // Update displayed entries when entries or filter changes
   useEffect(() => {
@@ -199,19 +201,25 @@ export function DirectoryScanner() {
 
   const sortEntries = (
     entriesToSort: FileSystemEntry[],
-    order: "asc" | "desc"
+    order: "asc" | "desc",
+    by: "size" | "count"
   ) => {
     return [...entriesToSort].sort((a, b) => {
-      return order === "asc"
-        ? a.size_bytes - b.size_bytes
-        : b.size_bytes - a.size_bytes;
+      const valueA = by === "size" ? a.size_bytes : a.entry_count;
+      const valueB = by === "size" ? b.size_bytes : b.entry_count;
+      return order === "asc" ? valueA - valueB : valueB - valueA;
     });
   };
 
   const toggleSortOrder = () => {
     const newOrder = sortOrder === "asc" ? "desc" : "asc";
     setSortOrder(newOrder);
-    setEntries(sortEntries(entries, newOrder));
+    setEntries(sortEntries(entries, newOrder, sortBy));
+  };
+
+  const changeSortBy = (by: "size" | "count") => {
+    setSortBy(by);
+    setEntries(sortEntries(entries, sortOrder, by));
   };
 
   const selectDirectory = async () => {
@@ -261,14 +269,18 @@ export function DirectoryScanner() {
         style={{
           ...style,
           display: "grid",
-          gridTemplateColumns: "1fr auto",
-          alignItems: "center"
+          gridTemplateColumns: "1fr auto auto",
+          alignItems: "center",
+          gap: "1rem"
         }}
         className="p-3 text-sm border-b last:border-0 hover:bg-gray-50 dark:hover:bg-gray-800"
       >
         <div className="truncate">{entry.path}</div>
         <div className="text-right font-mono">
-          {bytesToReadableSize(entry.size_bytes)} | {entry.size_bytes}
+          {bytesToReadableSize(entry.size_bytes)}
+        </div>
+        <div className="text-right font-mono">
+          {entry.entry_count.toLocaleString()} items
         </div>
       </div>
     );
@@ -306,20 +318,34 @@ export function DirectoryScanner() {
       )}
 
       {entries.length > 0 && (
-        <div className="mb-4 flex items-center gap-4">
-          <div className="flex-1">
-            <input
-              type="text"
-              placeholder="Filter by path..."
-              className="w-full p-2 border rounded"
-              value={filterValue}
-              onChange={(e) => setFilterValue(e.target.value)}
-            />
-          </div>
+        <div className="mb-4">
+          <div className="flex items-center gap-4 mb-4">
+            <div className="flex-1">
+              <input
+                type="text"
+                placeholder="Filter by path..."
+                className="w-full p-2 border rounded"
+                value={filterValue}
+                onChange={(e) => setFilterValue(e.target.value)}
+              />
+            </div>
 
-          <Button onClick={toggleSortOrder} variant="outline" size="sm">
-            Size {sortOrder === "asc" ? "↑" : "↓"}
-          </Button>
+            <div className="flex gap-2">
+              <Button onClick={() => changeSortBy("size")} variant={sortBy === "size" ? "default" : "outline"} size="sm">
+                Size
+              </Button>
+              <Button onClick={() => changeSortBy("count")} variant={sortBy === "count" ? "default" : "outline"} size="sm">
+                Items
+              </Button>
+              <Button onClick={toggleSortOrder} variant="outline" size="sm">
+                {sortOrder === "asc" ? "↑" : "↓"}
+              </Button>
+            </div>
+          </div>
+          
+          <div className="text-sm text-gray-500 mb-2">
+            {displayedEntries.length} entries
+          </div>
         </div>
       )}
 
