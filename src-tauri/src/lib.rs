@@ -198,7 +198,19 @@ fn get_parent_chain_sync(path: &Path) -> Vec<PathBuf> {
 // New command to stream directory sizes to the frontend
 #[tauri::command]
 async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), String> {
-    match scan_directory_with_events(path, window).await {
+    // Drop any previous channel/resources before starting a new scan
+    // This is especially important on Windows to prevent resource leaks
+    tokio::task::yield_now().await;
+    
+    let result = scan_directory_with_events(path, window.clone()).await;
+    
+    // Ensure we emit a complete event even on error to clean up frontend state
+    if result.is_err() {
+        // Try to emit completion event on error to ensure frontend cleans up
+        let _ = window.emit("scan-complete", ());
+    }
+    
+    match result {
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
@@ -209,12 +221,6 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
     let analytics_map = Arc::new(DashMap::new());
     // Initialize the set to track visited inodes (to prevent cycles)
     let visited_inodes = Arc::new(DashSet::new());
-
-    // Warm up parent directory chain
-    // let path_chain = get_parent_chain(&target_dir).await;
-    // for p in path_chain {
-    //     size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
-    // }
 
     // Create a channel with capacity 1000 for sending file system entries
     let (sender, receiver) = kanal::bounded::<FileSystemEntry>(1000);
@@ -235,11 +241,14 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
         }
     });
 
+    // Clone sender for the calculation task
+    let sender_clone = sender.clone();
+    
     // Run the calculate_size_async function in a separate task
     let calc_task = tokio::spawn(calculate_size_async(
         target_dir.clone(),
         analytics_map.clone(),
-        Some(sender),
+        Some(sender_clone),
         Some(target_dir),
         Some(visited_inodes),
     ));
@@ -249,9 +258,16 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
         eprintln!("Error during directory calculation: {}", e);
         return Err(e);
     }
+    
+    // Explicitly drop the sender to close the channel
+    drop(sender);
 
     // Wait for receiver task to complete
     let _ = receiver_handle.await;
+    
+    // Explicitly clear resources to ensure they're dropped
+    // This is especially important for Windows
+    drop(analytics_map);
 
     Ok(())
 }

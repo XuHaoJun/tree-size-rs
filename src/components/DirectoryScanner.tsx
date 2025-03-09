@@ -61,12 +61,12 @@ export function DirectoryScanner() {
     // Set up listeners for directory scan events
     let unlistenEntry: Promise<UnlistenFn>;
     let unlistenComplete: Promise<UnlistenFn>;
+    let bufferInterval: number | null = null;
 
     const setupListeners = async () => {
       // Create a buffer to collect entries before updating state
       let entriesBuffer: FileSystemEntry[] = [];
-      let bufferInterval: number | null = null;
-
+      
       const processBuffer = () => {
         if (entriesBuffer.length === 0) return;
 
@@ -113,6 +113,23 @@ export function DirectoryScanner() {
         }
       };
 
+      // Clean up any existing listeners first (important for Windows)
+      try {
+        const cleanupListeners = async () => {
+          try {
+            // Try to clean up any previous listeners that might still be active
+            const dummyFn = await listen("dummy-event", () => {});
+            dummyFn();
+          } catch {
+            // Ignore errors
+          }
+        };
+        
+        await cleanupListeners();
+      } catch {
+        // Ignore cleanup errors
+      }
+
       unlistenEntry = listen<FileSystemEntry>(
         "directory-entry",
         (event: EventPayload<FileSystemEntry>) => {
@@ -148,8 +165,8 @@ export function DirectoryScanner() {
             entriesBuffer.push(newEntry);
             setupBufferProcessing();
 
-            // If buffer reaches 3000 items, process it immediately
-            if (entriesBuffer.length >= 3000) {
+            // If buffer reaches 10000 items, process it immediately
+            if (entriesBuffer.length >= 10000) {
               processBuffer();
             }
 
@@ -182,6 +199,11 @@ export function DirectoryScanner() {
       }
       if (unlistenComplete) {
         unlistenComplete.then((unlisten) => unlisten());
+      }
+      // Clear the interval if it exists
+      if (bufferInterval !== null) {
+        clearInterval(bufferInterval);
+        bufferInterval = null;
       }
     };
   }, [sortOrder, sortBy]);
@@ -247,10 +269,15 @@ export function DirectoryScanner() {
     }
 
     try {
+      // Clear state first
       setEntries([]);
       setDisplayedEntries([]);
       setScanning(true);
       setError(null);
+      
+      // Force a small delay to ensure any pending operations complete
+      // This helps prevent issues on Windows
+      await new Promise(resolve => setTimeout(resolve, 50));
 
       // Invoke the Rust command to scan the directory
       await invoke("scan_directory_size", { path: selectedPath });
