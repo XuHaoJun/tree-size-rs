@@ -1079,6 +1079,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "filesize"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12d741e2415d4e2e5bd1c1d00409d1a8865a57892c2d689b504365655d237d43"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4587,6 +4596,7 @@ name = "tree-size-rs"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "filesize",
  "kanal",
  "rayon",
  "serde",
@@ -4598,6 +4608,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "tokio",
+ "winapi-util",
 ]
 
 [[package]]
