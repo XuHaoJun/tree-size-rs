@@ -60,9 +60,11 @@ jobs:
         run: |
           echo "Setting up Windows portable configuration"
           # Update tauri.conf.json for Tauri 2.0 portable configuration
-          jq '.bundle.windows.nsis = {"installMode": "currentUser"} | .bundle.targets = ["nsis"]' src-tauri/tauri.conf.json > tmp.json && mv tmp.json src-tauri/tauri.conf.json
+          jq '.bundle.windows.nsis = {"installMode": "currentUser"} | .bundle.targets = ["nsis"]' src-tauri/tauri.conf.json > tmp.json
+          Remove-Item -Path src-tauri/tauri.conf.json -Force
+          Move-Item -Path tmp.json -Destination src-tauri/tauri.conf.json
           # Verify the updated configuration
-          cat src-tauri/tauri.conf.json
+          Get-Content src-tauri/tauri.conf.json
       
       - name: Build Tauri App
         run: bun run tauri build --target '${{ matrix.target }}'
