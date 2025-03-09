@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
 use tokio::fs;
+use dashmap::DashSet;
 
 /// Represents size information for a file or directory
 #[derive(Clone, Debug, Serialize)]
@@ -22,8 +23,15 @@ async fn calculate_size_async(
     size_map: Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
     sender: Option<kanal::Sender<FileSystemEntry>>,
     target_dir_path: Option<PathBuf>,
+    visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
 ) -> std::io::Result<()> {
+    // Handle symlinks
     if path.is_symlink() {
+        // Only count the symlink itself, not what it points to
+        if let Ok(metadata) = fs::symlink_metadata(&path).await {
+            let self_size = metadata.len();
+            update_size(&path, self_size, &size_map, &sender);
+        }
         return Ok(());
     }
 
@@ -32,6 +40,22 @@ async fn calculate_size_async(
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
+
+    // Check for cycles using device and inode numbers on Unix-like systems
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let inode = metadata.ino();
+        let dev = metadata.dev();
+        let inode_pair = (dev, inode);
+
+        let visited = visited_inodes.clone().unwrap_or_else(|| Arc::new(DashSet::new()));
+        
+        // If we've seen this inode before, we have a cycle
+        if !visited.insert(inode_pair) && metadata.is_dir() {
+            return Ok(());
+        }
+    }
 
     let self_size = metadata.len();
 
@@ -64,8 +88,6 @@ async fn calculate_size_async(
                 counter.fetch_add(self_size, Ordering::Relaxed);
                 let value = counter.load(Ordering::Relaxed);
 
-                // println!("path: {}, bytes: {}", parent.display(), value);
-
                 // Send parent path and value to channel if available
                 if let Some(sender) = &sender {
                     let _ = sender.send(FileSystemEntry {
@@ -82,8 +104,6 @@ async fn calculate_size_async(
         counter.fetch_add(size, Ordering::Relaxed);
         let value = counter.load(Ordering::Relaxed);
         
-        // println!("path: {}, bytes: {}", path.display(), value);
-
         // Send path and value to channel if available
         if let Some(sender) = &sender {
             let _ = sender.send(FileSystemEntry {
@@ -98,6 +118,9 @@ async fn calculate_size_async(
         let mut entries = Vec::new();
         let mut children = fs::read_dir(&path).await?;
 
+        // Create visited_inodes set if it doesn't exist
+        let visited = visited_inodes.clone().unwrap_or_else(|| Arc::new(DashSet::new()));
+
         // Collect all subdirectory entries
         while let Some(entry) = children.next_entry().await? {
             entries.push(entry.path());
@@ -111,12 +134,34 @@ async fn calculate_size_async(
                 size_map.clone(),
                 sender.clone(),
                 target_dir_path.clone(),
+                Some(visited.clone()),
             ));
             future.await?;
         }
     }
 
     Ok(())
+}
+
+// Helper function to update size and send events
+fn update_size(
+    path: &Path, 
+    size: u64, 
+    size_map: &Arc<DashMap<PathBuf, Arc<AtomicU64>>>,
+    sender: &Option<kanal::Sender<FileSystemEntry>>
+) {
+    if let Some(counter) = size_map.get(path) {
+        counter.fetch_add(size, Ordering::Relaxed);
+        let value = counter.load(Ordering::Relaxed);
+        
+        // Send path and value to channel if available
+        if let Some(sender) = sender {
+            let _ = sender.send(FileSystemEntry {
+                path: path.to_path_buf(),
+                size_bytes: value,
+            });
+        }
+    }
 }
 
 // 同步版本的获取父目录链函数，用于 Rayon 并行处理
@@ -147,6 +192,8 @@ async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), 
 async fn scan_directory_with_events(path: String, window: tauri::Window) -> std::io::Result<()> {
     let target_dir = Path::new(&path).canonicalize()?;
     let size_map = Arc::new(DashMap::new());
+    // Initialize the set to track visited inodes (to prevent cycles)
+    let visited_inodes = Arc::new(DashSet::new());
 
     // Warm up parent directory chain
     // let path_chain = get_parent_chain(&target_dir).await;
@@ -179,6 +226,7 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
         size_map.clone(),
         Some(sender),
         Some(target_dir),
+        Some(visited_inodes),
     ));
 
     // Wait for calculation to complete and handle any errors
