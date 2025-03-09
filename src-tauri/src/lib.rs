@@ -1,12 +1,13 @@
-use dashmap::DashMap;
-use kanal;
-use serde::Serialize;
+mod platform;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::Emitter;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
+use serde::Serialize;
+use kanal;
+use tauri::Emitter;
 
 /// Contains analytics information for a directory or file
 #[derive(Debug)]
@@ -18,13 +19,6 @@ struct AnalyticsInfo {
 }
 
 impl AnalyticsInfo {
-    fn new() -> Self {
-        Self {
-            size_bytes: AtomicU64::new(0),
-            entry_count: AtomicU64::new(0),
-        }
-    }
-
     fn new_with_size(size: u64) -> Self {
         Self {
             size_bytes: AtomicU64::new(size),
@@ -52,51 +46,44 @@ async fn calculate_size_async(
     target_dir_path: Option<PathBuf>,
     visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
 ) -> std::io::Result<()> {
-    // Handle symlinks
-    if path.is_symlink() {
+    // Check if path is a symlink
+    let is_symlink = path.is_symlink();
+    
+    if is_symlink {
         // Only count the symlink itself, not what it points to
-        if let Ok(metadata) = fs::symlink_metadata(&path).await {
-            let self_size = metadata.len();
-            update_analytics(&path, self_size, 1, &analytics_map, &sender);
+        if let Some(path_info) = platform::get_path_info(&path, true, false) {
+            update_analytics(&path, path_info.size, 1, &analytics_map, &sender);
         }
         return Ok(());
     }
 
-    // Asynchronously get metadata
-    let metadata = match fs::metadata(&path).await {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
+    // Get path info using our platform-agnostic function
+    let path_info = match platform::get_path_info(&path, true, true) {
+        Some(info) => info,
+        None => return Ok(()),
     };
-
-    // Check for cycles using device and inode numbers on Unix-like systems
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let inode = metadata.ino();
-        let dev = metadata.dev();
-        let inode_pair = (dev, inode);
-
+    
+    // Check for cycles using device and inode numbers if available
+    if let Some(inode_pair) = path_info.inode_device {
         let visited = visited_inodes.clone().unwrap_or_else(|| Arc::new(DashSet::new()));
         
         // If we've seen this inode before, we have a cycle
-        if !visited.insert(inode_pair) && metadata.is_dir() {
+        if !visited.insert(inode_pair) && path_info.is_dir {
             return Ok(());
         }
     }
 
-    let self_size = metadata.len();
-    let is_dir = metadata.is_dir();
     let entry_count = 1; // Count this file/directory as 1
 
     // Handle updates directly
     let mut updates = vec![];
-    if is_dir {
+    if path_info.is_dir {
         match analytics_map.entry(path.clone()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
-                updates.push((e.get().clone(), self_size, entry_count, path.clone()));
+                updates.push((e.get().clone(), path_info.size, entry_count, path.clone()));
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                let analytics = Arc::new(AnalyticsInfo::new_with_size(self_size));
+                let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size));
                 updates.push((analytics.clone(), 0, 0, path.clone()));
                 e.insert(analytics);
             }
@@ -114,7 +101,7 @@ async fn calculate_size_async(
         for parent in parent_chain {
             // Skip if parent is not in map
             if let Some(analytics) = analytics_map.get(&parent) {
-                analytics.size_bytes.fetch_add(self_size, Ordering::Relaxed);
+                analytics.size_bytes.fetch_add(path_info.size, Ordering::Relaxed);
                 analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
                 
                 // Send parent path and values to channel if available
@@ -145,7 +132,7 @@ async fn calculate_size_async(
     }
 
     // Process subdirectories asynchronously
-    if is_dir {
+    if path_info.is_dir {
         let mut entries = Vec::new();
         let mut children = fs::read_dir(&path).await?;
 
@@ -208,11 +195,6 @@ fn get_parent_chain_sync(path: &Path) -> Vec<PathBuf> {
     chain
 }
 
-// 异步获取父目录链
-async fn get_parent_chain(path: &Path) -> Vec<PathBuf> {
-    get_parent_chain_sync(path)
-}
-
 // New command to stream directory sizes to the frontend
 #[tauri::command]
 async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), String> {
@@ -234,8 +216,8 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
     //     size_map.entry(p).or_insert(Arc::new(AtomicU64::new(0)));
     // }
 
-    // Create a channel with capacity 100 for sending file system entries
-    let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
+    // Create a channel with capacity 1000 for sending file system entries
+    let (sender, receiver) = kanal::bounded::<FileSystemEntry>(1000);
 
     // Spawn a task to process received entries and emit them as Tauri events
     let window_clone = window.clone();

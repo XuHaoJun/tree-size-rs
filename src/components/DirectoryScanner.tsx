@@ -109,7 +109,7 @@ export function DirectoryScanner() {
 
       const setupBufferProcessing = () => {
         if (bufferInterval === null) {
-          bufferInterval = window.setInterval(processBuffer, 200);
+          bufferInterval = window.setInterval(processBuffer, 1000);
         }
       };
 
@@ -148,8 +148,8 @@ export function DirectoryScanner() {
             entriesBuffer.push(newEntry);
             setupBufferProcessing();
 
-            // If buffer reaches 10000 items, process it immediately
-            if (entriesBuffer.length >= 10000) {
+            // If buffer reaches 3000 items, process it immediately
+            if (entriesBuffer.length >= 3000) {
               processBuffer();
             }
 
