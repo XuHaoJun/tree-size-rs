@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { bytesToReadableSize } from "@/lib/utils";
+import { FixedSizeList } from "react-window";
 
 interface FileSystemEntry {
   path: string;
@@ -26,6 +27,33 @@ export function DirectoryScanner() {
   const [error, setError] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
   const [filterValue, setFilterValue] = useState("");
+  const [listHeight, setListHeight] = useState(
+    typeof window !== "undefined" ? Math.max(400, window.innerHeight - 400) : 400
+  );
+  
+  // Reference to the container element for measuring
+  const containerRef = useRef<HTMLDivElement>(null);
+  
+  // Listen for window resize to adjust list height
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    
+    const handleResize = () => {
+      if (containerRef.current) {
+        // Calculate available height for the list
+        // Leave room for headers and other UI elements
+        const availableHeight = window.innerHeight - 200;
+        setListHeight(Math.min(Math.max(400, availableHeight), 800));
+      } else {
+        setListHeight(Math.max(400, window.innerHeight - 400));
+      }
+    };
+    
+    window.addEventListener("resize", handleResize);
+    handleResize(); // Initial calculation
+    
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     // Set up listeners for directory scan events
@@ -225,6 +253,27 @@ export function DirectoryScanner() {
     }
   };
 
+  // Row renderer for the virtualized list
+  const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => {
+    const entry = displayedEntries[index];
+    return (
+      <div
+        style={{
+          ...style,
+          display: "grid",
+          gridTemplateColumns: "1fr auto",
+          alignItems: "center"
+        }}
+        className="p-3 text-sm border-b last:border-0 hover:bg-gray-50 dark:hover:bg-gray-800"
+      >
+        <div className="truncate">{entry.path}</div>
+        <div className="text-right font-mono">
+          {bytesToReadableSize(entry.size_bytes)} | {entry.size_bytes}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="w-full max-w-4xl mx-auto p-4">
       <h1 className="text-2xl font-bold mb-4">Directory Size Scanner</h1>
@@ -274,27 +323,25 @@ export function DirectoryScanner() {
         </div>
       )}
 
-      <div className="border rounded-md">
+      <div className="border rounded-md" ref={containerRef}>
         <div className="grid grid-cols-[1fr_auto] font-medium p-3 border-b bg-gray-50 dark:bg-gray-800">
           <div>Path</div>
           <div>Size</div>
         </div>
 
-        <div className="max-h-[calc(100vh-360px)] overflow-y-auto">
+        <div>
           {displayedEntries.length > 0 ? (
-            displayedEntries.map((entry) => (
-              <div
-                key={entry.path}
-                className="grid grid-cols-[1fr_auto] p-3 text-sm border-b last:border-0 hover:bg-gray-50 dark:hover:bg-gray-800"
-              >
-                <div className="truncate">{entry.path}</div>
-                <div className="text-right font-mono">
-                  {bytesToReadableSize(entry.size_bytes)} | {entry.size_bytes}
-                </div>
-              </div>
-            ))
+            <FixedSizeList
+              height={listHeight}
+              width="100%"
+              itemCount={displayedEntries.length}
+              itemSize={46} // Approximate height of each row
+              overscanCount={5} // Render extra items for smoother scrolling
+            >
+              {Row}
+            </FixedSizeList>
           ) : (
-            <div className="p-3 text-center text-gray-500">
+            <div className="p-3 text-center text-gray-500 h-[300px] flex items-center justify-center">
               {scanning ? "Waiting for results..." : "No entries to display"}
             </div>
           )}
