@@ -16,13 +16,22 @@ struct AnalyticsInfo {
     size_bytes: AtomicU64,
     /// Total number of entries (files and directories)
     entry_count: AtomicU64,
+    /// Number of files
+    file_count: AtomicU64,
+    /// Number of directories
+    directory_count: AtomicU64,
 }
 
 impl AnalyticsInfo {
-    fn new_with_size(size: u64) -> Self {
+    fn new_with_size(size: u64, is_dir: bool) -> Self {
+        let file_count = if is_dir { 0 } else { 1 };
+        let directory_count = if is_dir { 1 } else { 0 };
+        
         Self {
             size_bytes: AtomicU64::new(size),
             entry_count: AtomicU64::new(1), // Count itself as 1 entry
+            file_count: AtomicU64::new(file_count),
+            directory_count: AtomicU64::new(directory_count),
         }
     }
 }
@@ -36,6 +45,10 @@ struct FileSystemEntry {
     size_bytes: u64,
     /// Number of entries (files and directories)
     entry_count: u64,
+    /// Number of files
+    file_count: u64,
+    /// Number of directories
+    directory_count: u64,
 }
 
 // Asynchronous recursive processing function
@@ -52,7 +65,7 @@ async fn calculate_size_async(
     if is_symlink {
         // Only count the symlink itself, not what it points to
         if let Some(path_info) = platform::get_path_info(&path, true, false) {
-            update_analytics(&path, path_info.size, 1, &analytics_map, &sender);
+            update_analytics(&path, path_info.size, 1, 0, 0, &analytics_map, &sender);
         }
         return Ok(());
     }
@@ -74,17 +87,19 @@ async fn calculate_size_async(
     }
 
     let entry_count = 1; // Count this file/directory as 1
+    let file_count = if path_info.is_dir { 0 } else { 1 };
+    let directory_count = if path_info.is_dir { 1 } else { 0 };
 
     // Handle updates directly
     let mut updates = vec![];
     if path_info.is_dir {
         match analytics_map.entry(path.clone()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
-                updates.push((e.get().clone(), path_info.size, entry_count, path.clone()));
+                updates.push((e.get().clone(), path_info.size, entry_count, file_count, directory_count, path.clone()));
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size));
-                updates.push((analytics.clone(), 0, 0, path.clone()));
+                let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size, path_info.is_dir));
+                updates.push((analytics.clone(), 0, 0, 0, 0, path.clone()));
                 e.insert(analytics);
             }
         }
@@ -103,6 +118,8 @@ async fn calculate_size_async(
             if let Some(analytics) = analytics_map.get(&parent) {
                 analytics.size_bytes.fetch_add(path_info.size, Ordering::Relaxed);
                 analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
+                analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
+                analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
                 
                 // Send parent path and values to channel if available
                 if let Some(sender) = &sender {
@@ -110,6 +127,8 @@ async fn calculate_size_async(
                         path: parent.clone(),
                         size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
                         entry_count: analytics.entry_count.load(Ordering::Relaxed),
+                        file_count: analytics.file_count.load(Ordering::Relaxed),
+                        directory_count: analytics.directory_count.load(Ordering::Relaxed),
                     });
                 }
             }
@@ -117,9 +136,11 @@ async fn calculate_size_async(
     }
 
     // Process updates
-    for (analytics, size, count, path) in updates {
+    for (analytics, size, count, file_count, directory_count, path) in updates {
         analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
         analytics.entry_count.fetch_add(count, Ordering::Relaxed);
+        analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
+        analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
         
         // Send path and values to channel if available
         if let Some(sender) = &sender {
@@ -127,6 +148,8 @@ async fn calculate_size_async(
                 path: path,
                 size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
                 entry_count: analytics.entry_count.load(Ordering::Relaxed),
+                file_count: analytics.file_count.load(Ordering::Relaxed),
+                directory_count: analytics.directory_count.load(Ordering::Relaxed),
             });
         }
     }
@@ -165,13 +188,17 @@ async fn calculate_size_async(
 fn update_analytics(
     path: &Path, 
     size: u64,
-    count: u64,
+    entry_count: u64,
+    file_count: u64,
+    directory_count: u64,
     analytics_map: &Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
     sender: &Option<kanal::Sender<FileSystemEntry>>
 ) {
     if let Some(analytics) = analytics_map.get(path) {
         analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
-        analytics.entry_count.fetch_add(count, Ordering::Relaxed);
+        analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
+        analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
+        analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
         
         // Send path and values to channel if available
         if let Some(sender) = sender {
@@ -179,6 +206,8 @@ fn update_analytics(
                 path: path.to_path_buf(),
                 size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
                 entry_count: analytics.entry_count.load(Ordering::Relaxed),
+                file_count: analytics.file_count.load(Ordering::Relaxed),
+                directory_count: analytics.directory_count.load(Ordering::Relaxed),
             });
         }
     }
