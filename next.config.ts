@@ -11,9 +11,6 @@ const nextConfig: NextConfig = {
     unoptimized: true,
   },
   assetPrefix: isProd ? undefined : `http://${internalHost}:3456`,
-  devIndicators: {
-    appIsrStatus: false,
-  },
   sassOptions: {
     silenceDeprecations: ['legacy-js-api'],
   },
