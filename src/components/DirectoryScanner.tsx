@@ -7,16 +7,23 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { bytesToReadableSize } from "@/lib/utils";
 import { TreeViewItem as BaseTreeViewItem } from "@/components/tree-view";
-import { 
-  Folder, Percent, AlignJustify, 
-  SortAsc, SortDesc, ChevronRight, ChevronDown,
-  Settings, HelpCircle, FolderOpen
+import {
+  Folder,
+  Percent,
+  AlignJustify,
+  SortAsc,
+  SortDesc,
+  ChevronRight,
+  ChevronDown,
+  Settings,
+  HelpCircle,
+  FolderOpen,
 } from "lucide-react";
-import { 
-  Tooltip, 
-  TooltipContent, 
-  TooltipProvider, 
-  TooltipTrigger 
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
@@ -49,24 +56,29 @@ interface FileSystemEntry {
 export function DirectoryScanner() {
   const [selectedPath, setSelectedPath] = useState<string>("");
   const [entries, setEntries] = useState<FileSystemEntry[]>([]);
-  const [displayedEntries, setDisplayedEntries] = useState<FileSystemEntry[]>([]);
+  const [displayedEntries, setDisplayedEntries] = useState<FileSystemEntry[]>(
+    []
+  );
   const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([]);
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
   const [sortBy, setSortBy] = useState<"size" | "count">("size");
   const [filterValue, setFilterValue] = useState("");
-  const [currentTab, setCurrentTab] = useState<"file" | "home" | "scan" | "view" | "options" | "help">("scan");
+  const [currentTab, setCurrentTab] = useState<
+    "file" | "home" | "scan" | "view" | "options" | "help"
+  >("scan");
   const [totalSize, setTotalSize] = useState<number>(0);
   const [totalFiles, setTotalFiles] = useState<number>(0);
   const [freeSpace, setFreeSpace] = useState<string>("N/A");
-  
+
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
     // Auto formatting
     return bytesToReadableSize(sizeInBytes);
   };
-  
+
   // Generate color based on percentage
   const getColorForPercentage = (): string => {
     // Using a single color (yellow) with fixed opacity
@@ -86,15 +98,15 @@ export function DirectoryScanner() {
   // Handle filtering and sorting when entries change
   useEffect(() => {
     let filtered = entries;
-    
+
     if (filterValue) {
-      filtered = entries.filter(entry => 
+      filtered = entries.filter((entry) =>
         entry.path.toLowerCase().includes(filterValue.toLowerCase())
       );
     }
-    
+
     setDisplayedEntries(filtered);
-    
+
     // Build tree structure
     buildTreeData(filtered);
   }, [entries, filterValue]);
@@ -150,7 +162,7 @@ export function DirectoryScanner() {
     const setupListeners = async () => {
       // Create a buffer to collect entries before updating state
       let entriesBuffer: FileSystemEntry[] = [];
-      
+
       const processBuffer = () => {
         if (entriesBuffer.length === 0) return;
 
@@ -208,57 +220,58 @@ export function DirectoryScanner() {
             // Ignore errors
           }
         };
-        
+
         await cleanupListeners();
       } catch {
         // Ignore cleanup errors
       }
 
-      unlistenEntry = listen<FileSystemEntry>(
-        "directory-entry",
-        (event) => {
-          const newEntry = event.payload as FileSystemEntry;
+      unlistenEntry = listen<FileSystemEntry>("directory-entry", (event) => {
+        const newEntry = event.payload as FileSystemEntry;
 
-          setEntries((prevEntries) => {
-            // If we have fewer than 100 entries, update immediately
-            if (prevEntries.length < 10) {
-              const existingEntryIndex = prevEntries.findIndex(
-                (entry) => entry.path === newEntry.path
-              );
+        setEntries((prevEntries) => {
+          // If we have fewer than 100 entries, update immediately
+          if (prevEntries.length < 10) {
+            const existingEntryIndex = prevEntries.findIndex(
+              (entry) => entry.path === newEntry.path
+            );
 
-              const updatedEntries =
-                existingEntryIndex >= 0
-                  ? [...prevEntries]
-                  : [...prevEntries, newEntry];
+            const updatedEntries =
+              existingEntryIndex >= 0
+                ? [...prevEntries]
+                : [...prevEntries, newEntry];
 
-              // If we found an existing entry, update it
-              if (existingEntryIndex >= 0) {
-                updatedEntries[existingEntryIndex] = newEntry;
-              }
-
-              // Sort entries
-              const sortedEntries = sortEntries(updatedEntries, sortOrder, sortBy);
-
-              // Clear the buffer
-              entriesBuffer = [];
-
-              return sortedEntries;
+            // If we found an existing entry, update it
+            if (existingEntryIndex >= 0) {
+              updatedEntries[existingEntryIndex] = newEntry;
             }
 
-            // If we have 100+ entries, use the buffer approach
-            entriesBuffer.push(newEntry);
-            setupBufferProcessing();
+            // Sort entries
+            const sortedEntries = sortEntries(
+              updatedEntries,
+              sortOrder,
+              sortBy
+            );
 
-            // If buffer reaches 10000 items, process it immediately
-            if (entriesBuffer.length >= 10000) {
-              processBuffer();
-            }
+            // Clear the buffer
+            entriesBuffer = [];
 
-            // Return unchanged state (buffer will update state later)
-            return prevEntries;
-          });
-        }
-      );
+            return sortedEntries;
+          }
+
+          // If we have 100+ entries, use the buffer approach
+          entriesBuffer.push(newEntry);
+          setupBufferProcessing();
+
+          // If buffer reaches 10000 items, process it immediately
+          if (entriesBuffer.length >= 10000) {
+            processBuffer();
+          }
+
+          // Return unchanged state (buffer will update state later)
+          return prevEntries;
+        });
+      });
 
       unlistenComplete = listen("scan-complete", () => {
         // Process any remaining entries in the buffer
@@ -271,7 +284,7 @@ export function DirectoryScanner() {
         }
 
         setScanning(false);
-        
+
         // Check free space
         if (selectedPath) {
           try {
@@ -279,7 +292,7 @@ export function DirectoryScanner() {
               .then((freeSpaceResult: unknown) => {
                 setFreeSpace(bytesToReadableSize(freeSpaceResult as number));
               })
-              .catch(err => {
+              .catch((err) => {
                 console.error("Error getting free space:", err);
               });
           } catch (err) {
@@ -308,7 +321,7 @@ export function DirectoryScanner() {
       }
     };
   }, [selectedPath, sortOrder, sortBy]);
-  
+
   const startScan = async () => {
     if (!selectedPath) {
       setError("Please select a directory first");
@@ -324,7 +337,7 @@ export function DirectoryScanner() {
 
       // Force a small delay to ensure any pending operations complete
       // This helps prevent issues on Windows
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       // Invoke the Rust command to scan the directory
       await invoke("scan_directory_size", { path: selectedPath });
@@ -333,6 +346,97 @@ export function DirectoryScanner() {
       setError(`Failed to scan directory: ${err}`);
       setScanning(false);
     }
+  };
+
+  // Smart expand the tree to show at least N items
+  const smartExpandTree = (
+    items: EnhancedTreeViewItem[],
+    expandedSet: Set<string>,
+    minItems = 10
+  ): Set<string> => {
+    let visibleCount = items.length;
+    const newExpandedSet = new Set(expandedSet);
+
+    // If we already have enough items visible, no need to expand further
+    if (visibleCount >= minItems) {
+      return newExpandedSet;
+    }
+
+    // Sort items by size to expand the largest directories first
+    const sortedItems = [...items].sort((a, b) => b.sizeBytes - a.sizeBytes);
+
+    // First pass: expand largest directories until we have enough visible items
+    for (const item of sortedItems) {
+      if (visibleCount >= minItems) break;
+
+      if (item.children && item.children.length > 0) {
+        newExpandedSet.add(item.id);
+        visibleCount += item.children.length;
+      }
+    }
+
+    // Second pass: if we still don't have enough items, recursively expand subdirectories
+    if (visibleCount < minItems) {
+      for (const item of sortedItems) {
+        if (
+          newExpandedSet.has(item.id) &&
+          item.children &&
+          item.children.length > 0
+        ) {
+          // Only recurse into directories we've already expanded
+          const childItems = item.children as EnhancedTreeViewItem[];
+          const updatedSet = smartExpandTree(
+            childItems,
+            newExpandedSet,
+            minItems
+          );
+
+          // Update our expanded set with any new expansions
+          for (const id of updatedSet) {
+            newExpandedSet.add(id);
+          }
+
+          // Recalculate visible count
+          visibleCount = countVisibleItems(items, newExpandedSet);
+
+          if (visibleCount >= minItems) break;
+        }
+      }
+    }
+
+    return newExpandedSet;
+  };
+
+  // Count visible items in the tree
+  const countVisibleItems = (
+    items: EnhancedTreeViewItem[],
+    expandedSet: Set<string>
+  ): number => {
+    let count = items.length;
+
+    for (const item of items) {
+      if (expandedSet.has(item.id) && item.children) {
+        count += countVisibleItems(
+          item.children as EnhancedTreeViewItem[],
+          expandedSet
+        );
+      }
+    }
+
+    return count;
+  };
+
+  // Handle toggle expand
+  const handleToggleExpand = (itemId: string) => {
+    setExpandedItems((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(itemId)) {
+        newSet.delete(itemId);
+      } else {
+        newSet.add(itemId);
+      }
+      return newSet;
+    });
   };
 
   // Build tree data from flat entries
@@ -345,25 +449,31 @@ export function DirectoryScanner() {
     }
 
     // Calculate total size and files
-    const totalBytes = entriesData.reduce((sum, entry) => sum + entry.size_bytes, 0);
-    const totalFileCount = entriesData.reduce((sum, entry) => sum + entry.file_count, 0);
+    const totalBytes = entriesData.reduce(
+      (sum, entry) => sum + entry.size_bytes,
+      0
+    );
+    const totalFileCount = entriesData.reduce(
+      (sum, entry) => sum + entry.file_count,
+      0
+    );
     setTotalSize(totalBytes);
     setTotalFiles(totalFileCount);
 
     // Create a map to store nodes by path
     const pathMap = new Map<string, EnhancedTreeViewItem>();
     const rootItems: EnhancedTreeViewItem[] = [];
-    
+
     // First pass: create all nodes and add them to the map
     entriesData.forEach((entry) => {
       const pathParts = entry.path.split("/");
       const name = pathParts[pathParts.length - 1] || entry.path;
       const isDirectory = entry.directory_count > 0;
       const depth = pathParts.length - 1;
-      
+
       // Calculate percentage of parent (will adjust later)
       const percentOfParent = 100;
-      
+
       const item: EnhancedTreeViewItem = {
         id: entry.path,
         name,
@@ -378,17 +488,17 @@ export function DirectoryScanner() {
         lastModified: entry.last_modified || new Date().toLocaleDateString(),
         owner: entry.owner || "Unknown",
         depth,
-        backgroundColor: getColorForPercentage()
+        backgroundColor: getColorForPercentage(),
       };
-      
+
       pathMap.set(entry.path, item);
     });
-    
+
     // Second pass: build the tree structure and calculate percentages
     entriesData.forEach((entry) => {
       const item = pathMap.get(entry.path);
       if (!item) return;
-      
+
       // Find the parent directory path
       const lastSlashIndex = entry.path.lastIndexOf("/");
       if (lastSlashIndex === -1) {
@@ -396,26 +506,25 @@ export function DirectoryScanner() {
         rootItems.push(item);
         return;
       }
-      
+
       const parentPath = entry.path.substring(0, lastSlashIndex);
       const parent = pathMap.get(parentPath);
-      
+
       if (parent && parent.children) {
         // Add to parent's children
         parent.children.push(item);
-        
+
         // Update parent's file and folder counts
         if (item.type === "directory") {
           parent.folderCount += item.folderCount;
         } else {
           parent.fileCount += 1;
         }
-        
+
         // Calculate percentage of parent
-        item.percentOfParent = parent.sizeBytes > 0 
-          ? (item.sizeBytes / parent.sizeBytes) * 100 
-          : 0;
-          
+        item.percentOfParent =
+          parent.sizeBytes > 0 ? (item.sizeBytes / parent.sizeBytes) * 100 : 0;
+
         // Update background color based on percentage
         item.backgroundColor = getColorForPercentage();
       } else {
@@ -427,41 +536,63 @@ export function DirectoryScanner() {
     // Sort children by size
     const sortTreeItems = (items: EnhancedTreeViewItem[]) => {
       items.sort((a, b) => b.sizeBytes - a.sizeBytes);
-      items.forEach(item => {
+      items.forEach((item) => {
         if (item.children && item.children.length > 0) {
           sortTreeItems(item.children as EnhancedTreeViewItem[]);
         }
       });
     };
-    
+
     sortTreeItems(rootItems);
-    
+
     setTreeData(rootItems);
+
+    // Smart expand the tree to show at least 10 items
+    setExpandedItems((prev) => smartExpandTree(rootItems, prev, 10));
   };
 
   return (
     <div className="h-full flex flex-col">
       {/* Toolbar */}
       <div className="border-b bg-muted/40">
-        <Tabs defaultValue={currentTab} onValueChange={(v: string) => setCurrentTab(v as "file" | "home" | "scan" | "view" | "options" | "help")}>
+        <Tabs
+          defaultValue={currentTab}
+          onValueChange={(v: string) =>
+            setCurrentTab(
+              v as "file" | "home" | "scan" | "view" | "options" | "help"
+            )
+          }
+        >
           <TabsList className="h-10">
-            <TabsTrigger value="file" className="px-3 py-1">File</TabsTrigger>
-            <TabsTrigger value="home" className="px-3 py-1">Home</TabsTrigger>
-            <TabsTrigger value="scan" className="px-3 py-1">Scan</TabsTrigger>
-            <TabsTrigger value="view" className="px-3 py-1">View</TabsTrigger>
-            <TabsTrigger value="options" className="px-3 py-1">Options</TabsTrigger>
-            <TabsTrigger value="help" className="px-3 py-1">Help</TabsTrigger>
+            <TabsTrigger value="file" className="px-3 py-1">
+              File
+            </TabsTrigger>
+            <TabsTrigger value="home" className="px-3 py-1">
+              Home
+            </TabsTrigger>
+            <TabsTrigger value="scan" className="px-3 py-1">
+              Scan
+            </TabsTrigger>
+            <TabsTrigger value="view" className="px-3 py-1">
+              View
+            </TabsTrigger>
+            <TabsTrigger value="options" className="px-3 py-1">
+              Options
+            </TabsTrigger>
+            <TabsTrigger value="help" className="px-3 py-1">
+              Help
+            </TabsTrigger>
           </TabsList>
-          
+
           {/* Main Actions Toolbar */}
           <div className="flex items-center p-1 border-t">
             <TooltipProvider>
               <div className="flex border-r px-2">
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button 
+                    <Button
                       variant="default"
-                      size="sm" 
+                      size="sm"
                       className="h-14 w-14 flex flex-col items-center gap-1"
                     >
                       <Percent className="h-5 w-5" />
@@ -471,13 +602,13 @@ export function DirectoryScanner() {
                   <TooltipContent>Show percentage of parent</TooltipContent>
                 </Tooltip>
               </div>
-              
+
               <div className="flex border-r px-2">
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button 
-                      variant="ghost" 
-                      size="sm" 
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       className="h-14 w-14 flex flex-col items-center gap-1"
                       onClick={selectDirectory}
                       disabled={scanning}
@@ -488,12 +619,12 @@ export function DirectoryScanner() {
                   </TooltipTrigger>
                   <TooltipContent>Select a directory to scan</TooltipContent>
                 </Tooltip>
-                
+
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button 
-                      variant="ghost" 
-                      size="sm" 
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       className="h-14 w-14 flex flex-col items-center gap-1"
                       onClick={startScan}
                       disabled={!selectedPath || scanning}
@@ -505,13 +636,13 @@ export function DirectoryScanner() {
                   <TooltipContent>Scan the selected directory</TooltipContent>
                 </Tooltip>
               </div>
-              
+
               <div className="flex border-r px-2">
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button 
-                      variant="ghost" 
-                      size="sm" 
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       className="h-14 w-14 flex flex-col items-center gap-1"
                       onClick={toggleSortOrder}
                     >
@@ -525,10 +656,14 @@ export function DirectoryScanner() {
                   </TooltipTrigger>
                   <TooltipContent>Toggle sort order</TooltipContent>
                 </Tooltip>
-                
+
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button variant="ghost" size="sm" className="h-14 w-14 flex flex-col items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-14 w-14 flex flex-col items-center gap-1"
+                    >
                       <Settings className="h-5 w-5" />
                       <span className="text-xs">Configure</span>
                     </Button>
@@ -536,11 +671,15 @@ export function DirectoryScanner() {
                   <TooltipContent>Configure display options</TooltipContent>
                 </Tooltip>
               </div>
-              
+
               <div className="flex px-2">
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button variant="ghost" size="sm" className="h-14 w-14 flex flex-col items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-14 w-14 flex flex-col items-center gap-1"
+                    >
                       <HelpCircle className="h-5 w-5" />
                       <span className="text-xs">Help</span>
                     </Button>
@@ -552,21 +691,19 @@ export function DirectoryScanner() {
           </div>
         </Tabs>
       </div>
-      
+
       {/* Path display */}
       {selectedPath && (
-        <div className="p-2 text-sm bg-muted/20 border-b">
-          {selectedPath}
-        </div>
+        <div className="p-2 text-sm bg-muted/20 border-b">{selectedPath}</div>
       )}
-      
+
       {/* Error display */}
       {error && (
         <div className="p-2 text-sm text-destructive bg-destructive/10">
           {error}
         </div>
       )}
-      
+
       {/* Main content */}
       <div className="flex-1 overflow-auto">
         {treeData.length > 0 ? (
@@ -579,7 +716,7 @@ export function DirectoryScanner() {
                 onChange={(e) => setFilterValue(e.target.value)}
                 className="w-64 text-sm"
               />
-              
+
               <div className="flex gap-2 items-center">
                 <Button
                   onClick={toggleSortOrder}
@@ -589,7 +726,7 @@ export function DirectoryScanner() {
                 >
                   {sortOrder === "asc" ? "↑" : "↓"}
                 </Button>
-                
+
                 <Button
                   onClick={() => changeSortBy("size")}
                   variant={sortBy === "size" ? "secondary" : "ghost"}
@@ -598,7 +735,7 @@ export function DirectoryScanner() {
                 >
                   Size
                 </Button>
-                
+
                 <Button
                   onClick={() => changeSortBy("count")}
                   variant={sortBy === "count" ? "secondary" : "ghost"}
@@ -609,48 +746,46 @@ export function DirectoryScanner() {
                 </Button>
               </div>
             </div>
-            
-            <TreeSizeView 
-              data={treeData} 
+
+            <TreeSizeView
+              data={treeData}
               formatSize={formatSize}
+              expandedItems={expandedItems}
+              onToggleExpand={handleToggleExpand}
             />
           </>
         ) : (
           <div className="flex items-center justify-center h-full">
             <div className="text-muted p-8 text-center">
               <FolderOpen className="w-12 h-12 mx-auto mb-2 opacity-20" />
-              <h3 className="text-lg font-medium mb-1">No directory selected</h3>
+              <h3 className="text-lg font-medium mb-1">
+                No directory selected
+              </h3>
               <p className="text-sm text-muted-foreground mb-4">
                 Select a directory to scan and analyze its size
               </p>
-              <Button onClick={selectDirectory}>
-                Select Directory
-              </Button>
+              <Button onClick={selectDirectory}>Select Directory</Button>
             </div>
           </div>
         )}
       </div>
-      
+
       {/* Status bar */}
-      <div className="border-t py-2 px-4 text-sm flex justify-between">
-        <div>
-          {scanning && (
-            <span className="text-muted-foreground animate-pulse">
-              Scanning... {displayedEntries.length} entries found
-            </span>
-          )}
-          {!scanning && treeData.length > 0 && (
-            <span>
-              {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
-            </span>
-          )}
-        </div>
-        <div>
-          {freeSpace !== "N/A" && `Free space: ${freeSpace}`}
-          {totalFiles.toLocaleString()} Files
-        </div>
-        <div>
-          Total Size: {formatSize(totalSize)}
+      <div className="flex justify-between">
+        <div>{freeSpace !== "N/A" && `Free space: ${freeSpace}`}</div>
+        <div className="border-t py-2 px-4 text-sm flex justify-between">
+          <div>
+            {scanning && (
+              <span className="text-muted-foreground animate-pulse">
+                Scanning... {displayedEntries.length} entries found
+              </span>
+            )}
+            {!scanning && treeData.length > 0 && (
+              <span>
+                {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
+              </span>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -658,9 +793,16 @@ export function DirectoryScanner() {
 }
 
 // Tree View component specifically designed for TreeSize
-function TreeSizeView({ data, formatSize }: { 
-  data: EnhancedTreeViewItem[], 
-  formatSize: (size: number) => string
+function TreeSizeView({
+  data,
+  formatSize,
+  expandedItems,
+  onToggleExpand,
+}: {
+  data: EnhancedTreeViewItem[];
+  formatSize: (size: number) => string;
+  expandedItems: Set<string>;
+  onToggleExpand: (itemId: string) => void;
 }) {
   return (
     <div className="h-full">
@@ -675,14 +817,17 @@ function TreeSizeView({ data, formatSize }: {
         <div className="p-2 w-32">Last Modified</div>
         <div className="p-2 w-32">Owner</div>
       </div>
-      
+
       {/* Tree rows */}
       <div className="h-full overflow-auto">
         {data.map((item) => (
-          <TreeSizeItem 
-            key={item.id} 
-            item={item} 
+          <TreeSizeItem
+            key={item.id}
+            item={item}
             formatSize={formatSize}
+            expanded={expandedItems.has(item.id)}
+            onToggleExpand={onToggleExpand}
+            expandedItems={expandedItems}
           />
         ))}
       </div>
@@ -691,37 +836,44 @@ function TreeSizeView({ data, formatSize }: {
 }
 
 // Individual tree item component
-function TreeSizeItem({ item, formatSize }: { 
-  item: EnhancedTreeViewItem, 
-  formatSize: (size: number) => string
+function TreeSizeItem({
+  item,
+  formatSize,
+  expanded,
+  onToggleExpand,
+  expandedItems,
+}: {
+  item: EnhancedTreeViewItem;
+  formatSize: (size: number) => string;
+  expanded: boolean;
+  onToggleExpand: (itemId: string) => void;
+  expandedItems: Set<string>;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  
   const toggleExpand = () => {
     if (item.children && item.children.length > 0) {
-      setExpanded(!expanded);
+      onToggleExpand(item.id);
     }
   };
-  
+
   const hasChildren = item.children && item.children.length > 0;
   const isSignificantSize = item.percentOfParent >= 20;
-  
+
   return (
     <div>
       {/* Main row */}
-      <div 
-        className="grid grid-cols-[auto_1fr_repeat(6,auto)] text-sm border-b hover:bg-muted/30 transition-colors"
-      >
-        <div className="p-1 flex items-center justify-center" onClick={toggleExpand}>
-          {hasChildren && (
-            expanded ? (
+      <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] text-sm border-b hover:bg-muted/30 transition-colors">
+        <div
+          className="p-1 flex items-center justify-center"
+          onClick={toggleExpand}
+        >
+          {hasChildren &&
+            (expanded ? (
               <ChevronDown className="h-4 w-4 cursor-pointer" />
             ) : (
               <ChevronRight className="h-4 w-4 cursor-pointer" />
-            )
-          )}
+            ))}
         </div>
-        
+
         <div className="p-2 flex items-center gap-1 truncate relative">
           {/* Icon */}
           <div className="flex-shrink-0">
@@ -731,52 +883,65 @@ function TreeSizeItem({ item, formatSize }: {
               <FileIcon className="h-4 w-4 text-gray-500" />
             )}
           </div>
-          
+
           {/* Percentage background bar */}
-          <div 
-            className="absolute left-7 top-0 bottom-0 bg-yellow-200 opacity-50 z-0" 
-            style={{ 
-              width: `${Math.min(item.percentOfParent, 100)}%`, 
-              backgroundColor: item.backgroundColor || "rgba(255, 215, 0, 0.4)" 
+          <div
+            className="absolute left-7 top-0 bottom-0 bg-yellow-200 opacity-50 z-0"
+            style={{
+              width: `${Math.min(item.percentOfParent, 100)}%`,
+              backgroundColor: item.backgroundColor || "rgba(255, 215, 0, 0.4)",
             }}
           />
-          
+
           {/* File/folder name - bold if significant percentage */}
-          <span className={`truncate z-10 relative ${isSignificantSize ? 'font-bold' : 'font-normal'}`}>
+          <span
+            className={`truncate z-10 relative ${
+              isSignificantSize ? "font-bold" : "font-normal"
+            }`}
+          >
             {item.name}
           </span>
         </div>
-        
+
         {/* Always show size */}
-        <div className="p-2 text-right font-mono w-24">{formatSize(item.sizeBytes)}</div>
-        
+        <div className="p-2 text-right font-mono w-24">
+          {formatSize(item.sizeBytes)}
+        </div>
+
         {/* Always show percent of parent */}
-        <div className={`p-2 text-right font-mono w-24 ${isSignificantSize ? 'font-bold' : 'font-normal'}`}>
+        <div
+          className={`p-2 text-right font-mono w-24 ${
+            isSignificantSize ? "font-bold" : "font-normal"
+          }`}
+        >
           {item.percentOfParent.toFixed(1)}%
         </div>
-        
+
         {/* Files count */}
         <div className="p-2 text-right font-mono w-16">
           {item.fileCount.toLocaleString()}
         </div>
-        
+
         {/* Folders count */}
         <div className="p-2 text-right font-mono w-16">
           {item.folderCount.toLocaleString()}
         </div>
-        
+
         <div className="p-2 w-32">{item.lastModified}</div>
         <div className="p-2 w-32">{item.owner}</div>
       </div>
-      
+
       {/* Children */}
       {expanded && item.children && (
         <div className="pl-4">
           {(item.children as EnhancedTreeViewItem[]).map((child) => (
-            <TreeSizeItem 
-              key={child.id} 
-              item={child} 
+            <TreeSizeItem
+              key={child.id}
+              item={child}
               formatSize={formatSize}
+              expanded={expandedItems.has(child.id)}
+              onToggleExpand={onToggleExpand}
+              expandedItems={expandedItems}
             />
           ))}
         </div>

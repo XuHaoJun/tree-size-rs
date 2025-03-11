@@ -301,6 +301,22 @@ async fn scan_directory_with_events(path: String, window: tauri::Window) -> std:
     Ok(())
 }
 
+#[tauri::command]
+fn get_free_space(path: String) -> Result<u64, String> {
+    match platform::get_space_info(&path) {
+        Some((_, available, _)) => Ok(available),
+        None => Err("Failed to get free space".to_string()),
+    }
+}
+
+#[tauri::command]
+fn get_space_info(path: String) -> Result<(u64, u64, u64), String> {
+    match platform::get_space_info(&path) {
+        Some((total, available, used)) => Ok((total, available, used)),
+        None => Err("Failed to get space information".to_string()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Create a multi-threaded Tokio runtime
@@ -314,7 +330,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![scan_directory_size])
+        .invoke_handler(tauri::generate_handler![
+            scan_directory_size,
+            get_free_space,
+            get_space_info
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

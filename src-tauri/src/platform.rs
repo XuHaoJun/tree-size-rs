@@ -23,6 +23,8 @@ pub struct PathInfo {
     pub times: (i64, i64, i64),
     /// Whether the path is a directory
     pub is_dir: bool,
+    // Whether the path is a file
+    pub is_file: bool,
 }
 
 /// Get complete path information in a platform-agnostic way
@@ -40,12 +42,14 @@ pub fn get_path_info<P: AsRef<Path>>(path: P, use_apparent_size: bool, follow_li
     };
     
     let is_dir = metadata.is_dir();
+    let is_file = metadata.is_file();
     
     Some(PathInfo {
         size,
         inode_device,
         times,
         is_dir,
+        is_file,
     })
 }
 
@@ -233,4 +237,68 @@ pub fn get_metadata<P: AsRef<Path>>(
         }
         _ => get_metadata_expensive(path, use_apparent_size),
     }
+}
+
+/// Get disk space information for a given path
+/// Returns a tuple of (total_space, available_space, used_space) in bytes
+/// If the information can't be retrieved, returns None
+pub fn get_space_info<P: AsRef<Path>>(path: P) -> Option<(u64, u64, u64)> {
+    use sysinfo::{Disks};
+    
+    let path_ref = path.as_ref();
+    
+    // First, ensure the path exists
+    let metadata = get_path_info(path_ref, false, false)?;
+    
+    // Get the canonical path
+    let canonical_path = path_ref.canonicalize().ok()?;
+    
+    // If it's a file, get the parent directory
+    let dir_path = if metadata.is_file {
+        canonical_path.parent()?.to_path_buf()
+    } else {
+        canonical_path
+    };
+    
+    // Get all disk information
+    let disks = Disks::new_with_refreshed_list();
+    
+    // Find the disk that contains our path
+    for disk in &disks {
+        let mount_point = disk.mount_point();
+        
+        // Check if our path is on this disk
+        // In Unix-like systems, we check if our path starts with the mount point
+        // In Windows, we compare drive letters
+        #[cfg(target_family = "unix")]
+        let on_this_disk = dir_path.starts_with(mount_point);
+        
+        #[cfg(target_os = "windows")]
+        let on_this_disk = {
+            if let Some(dir_prefix) = dir_path.components().next() {
+                if let Some(mount_prefix) = mount_point.components().next() {
+                    // Compare drive letters (usually the prefix)
+                    format!("{:?}", dir_prefix) == format!("{:?}", mount_prefix)
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        
+        #[cfg(not(any(target_family = "unix", target_os = "windows")))]
+        let on_this_disk = dir_path.starts_with(mount_point);
+        
+        if on_this_disk {
+            let total = disk.total_space();
+            let available = disk.available_space();
+            let used = total.saturating_sub(available);
+            
+            return Some((total, available, used));
+        }
+    }
+    
+    // If we get here, we couldn't find the disk for the path
+    None
 }
