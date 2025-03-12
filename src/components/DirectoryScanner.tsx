@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { bytesToReadableSize } from "@/lib/utils";
+import { bytesToReadableSize, normalizePath, getParentPath } from "@/lib/utils";
 import { TreeViewItem as BaseTreeViewItem } from "@/components/tree-view";
 import {
   Folder,
@@ -101,7 +101,7 @@ export function DirectoryScanner() {
 
     if (filterValue) {
       filtered = entries.filter((entry) =>
-        entry.path.toLowerCase().includes(filterValue.toLowerCase())
+        normalizePath(entry.path).toLowerCase().includes(filterValue.toLowerCase())
       );
     }
 
@@ -146,6 +146,12 @@ export function DirectoryScanner() {
 
       if (selected && !Array.isArray(selected)) {
         setSelectedPath(selected);
+        
+        // Reset any previous scan data when selecting a new directory
+        setEntries([]);
+        setDisplayedEntries([]);
+        setTreeData([]);
+        setError(null);
       }
     } catch (err) {
       console.error("Error selecting directory:", err);
@@ -466,16 +472,18 @@ export function DirectoryScanner() {
 
     // First pass: create all nodes and add them to the map
     entriesData.forEach((entry) => {
-      const pathParts = entry.path.split("/");
-      const name = pathParts[pathParts.length - 1] || entry.path;
+      // Normalize path for display
+      const normalizedPath = normalizePath(entry.path);
+      // Get just the filename or folder name
+      const name = normalizePath(entry.path, true);
       const isDirectory = entry.directory_count > 0;
-      const depth = pathParts.length - 1;
+      const depth = normalizedPath.split('/').length - 1;
 
       // Calculate percentage of parent (will adjust later)
       const percentOfParent = 100;
 
       const item: EnhancedTreeViewItem = {
-        id: entry.path,
+        id: entry.path, // Keep original path as ID
         name,
         type: isDirectory ? "directory" : "file",
         children: isDirectory ? [] : undefined,
@@ -500,14 +508,13 @@ export function DirectoryScanner() {
       if (!item) return;
 
       // Find the parent directory path
-      const lastSlashIndex = entry.path.lastIndexOf("/");
-      if (lastSlashIndex === -1) {
+      const parentPath = getParentPath(entry.path);
+      if (!parentPath) {
         // This is a root item
         rootItems.push(item);
         return;
       }
 
-      const parentPath = entry.path.substring(0, lastSlashIndex);
       const parent = pathMap.get(parentPath);
 
       if (parent && parent.children) {
@@ -694,7 +701,7 @@ export function DirectoryScanner() {
 
       {/* Path display */}
       {selectedPath && (
-        <div className="p-2 text-sm bg-muted/20 border-b">{selectedPath}</div>
+        <div className="p-2 text-sm bg-muted/20 border-b">{normalizePath(selectedPath)}</div>
       )}
 
       {/* Error display */}
