@@ -85,6 +85,25 @@ export function DirectoryScanner() {
     return "rgba(255, 215, 0, 0.4)"; // Gold color with fixed opacity
   };
 
+  // Apply full-height style to ensure proper layout in all browsers
+  useEffect(() => {
+    const appRoot = document.getElementById('root');
+    if (appRoot) {
+      appRoot.style.height = '100vh';
+      appRoot.style.display = 'flex';
+      appRoot.style.flexDirection = 'column';
+      appRoot.style.overflow = 'hidden';
+    }
+    return () => {
+      if (appRoot) {
+        appRoot.style.height = '';
+        appRoot.style.display = '';
+        appRoot.style.flexDirection = '';
+        appRoot.style.overflow = '';
+      }
+    };
+  }, []);
+
   // Handle window resize
   useEffect(() => {
     window.addEventListener("resize", handleResize);
@@ -559,9 +578,9 @@ export function DirectoryScanner() {
   };
 
   return (
-    <div className="h-full flex flex-col">
-      {/* Toolbar */}
-      <div className="border-b bg-muted/40">
+    <div className="h-full w-full flex flex-col overflow-hidden" style={{ height: '100vh', maxHeight: '100vh' }}>
+      {/* Toolbar - Fixed at top */}
+      <div className="border-b bg-muted/40 flex-shrink-0 z-20">
         <Tabs
           defaultValue={currentTab}
           onValueChange={(v: string) =>
@@ -699,23 +718,23 @@ export function DirectoryScanner() {
         </Tabs>
       </div>
 
-      {/* Path display */}
+      {/* Path display - Fixed below toolbar */}
       {selectedPath && (
-        <div className="p-2 text-sm bg-muted/20 border-b">{normalizePath(selectedPath)}</div>
+        <div className="p-2 text-sm bg-muted/20 border-b flex-shrink-0 z-10">{normalizePath(selectedPath)}</div>
       )}
 
-      {/* Error display */}
+      {/* Error display - Fixed below path display if there's an error */}
       {error && (
-        <div className="p-2 text-sm text-destructive bg-destructive/10">
+        <div className="p-2 text-sm text-destructive bg-destructive/10 flex-shrink-0 z-10">
           {error}
         </div>
       )}
 
-      {/* Main content */}
-      <div className="flex-1 overflow-auto">
+      {/* Main content - Scrollable */}
+      <div className="flex-grow flex flex-col overflow-hidden h-0">
         {treeData.length > 0 ? (
           <>
-            <div className="p-2 flex justify-between items-center border-b">
+            <div className="p-2 flex justify-between items-center border-b flex-shrink-0 bg-background z-10">
               <Input
                 type="text"
                 placeholder="Filter files and folders..."
@@ -754,12 +773,14 @@ export function DirectoryScanner() {
               </div>
             </div>
 
-            <TreeSizeView
-              data={treeData}
-              formatSize={formatSize}
-              expandedItems={expandedItems}
-              onToggleExpand={handleToggleExpand}
-            />
+            <div className="flex-grow overflow-auto h-0">
+              <TreeSizeView
+                data={treeData}
+                formatSize={formatSize}
+                expandedItems={expandedItems}
+                onToggleExpand={handleToggleExpand}
+              />
+            </div>
           </>
         ) : (
           <div className="flex items-center justify-center h-full">
@@ -777,22 +798,20 @@ export function DirectoryScanner() {
         )}
       </div>
 
-      {/* Status bar */}
-      <div className="flex justify-between">
+      {/* Status bar - Fixed at bottom */}
+      <div className="flex justify-between border-t py-2 px-4 text-sm flex-shrink-0 bg-muted/20 z-10">
         <div>{freeSpace !== "N/A" && `Free space: ${freeSpace}`}</div>
-        <div className="border-t py-2 px-4 text-sm flex justify-between">
-          <div>
-            {scanning && (
-              <span className="text-muted-foreground animate-pulse">
-                Scanning... {displayedEntries.length} entries found
-              </span>
-            )}
-            {!scanning && treeData.length > 0 && (
-              <span>
-                {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
-              </span>
-            )}
-          </div>
+        <div>
+          {scanning && (
+            <span className="text-muted-foreground animate-pulse">
+              Scanning... {displayedEntries.length} entries found
+            </span>
+          )}
+          {!scanning && treeData.length > 0 && (
+            <span>
+              {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -812,9 +831,9 @@ function TreeSizeView({
   onToggleExpand: (itemId: string) => void;
 }) {
   return (
-    <div className="h-full">
-      {/* Header */}
-      <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] sticky top-0 bg-muted/50 text-sm font-medium border-b select-none">
+    <div className="h-full flex flex-col">
+      {/* Header - Sticky */}
+      <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] sticky top-0 bg-muted/90 text-sm font-medium border-b select-none z-10 shadow-sm flex-shrink-0">
         <div className="w-6"></div>
         <div className="p-2">Name</div>
         <div className="p-2 text-right w-24">Size</div>
@@ -825,8 +844,8 @@ function TreeSizeView({
         <div className="p-2 w-32">Owner</div>
       </div>
 
-      {/* Tree rows */}
-      <div className="h-full overflow-auto">
+      {/* Tree rows - Scrollable */}
+      <div className="flex-grow overflow-auto h-0">
         {data.map((item) => (
           <TreeSizeItem
             key={item.id}
@@ -870,14 +889,14 @@ function TreeSizeItem({
       {/* Main row */}
       <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] text-sm border-b hover:bg-muted/30 transition-colors">
         <div
-          className="p-1 flex items-center justify-center"
+          className="p-1 flex items-center justify-center cursor-pointer"
           onClick={toggleExpand}
         >
           {hasChildren &&
             (expanded ? (
-              <ChevronDown className="h-4 w-4 cursor-pointer" />
+              <ChevronDown className="h-4 w-4" />
             ) : (
-              <ChevronRight className="h-4 w-4 cursor-pointer" />
+              <ChevronRight className="h-4 w-4" />
             ))}
         </div>
 
