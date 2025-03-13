@@ -4621,6 +4621,7 @@ dependencies = [
  "dashmap",
  "filesize",
  "kanal",
+ "log",
  "serde",
  "serde_json",
  "sysinfo",

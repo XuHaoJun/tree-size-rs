@@ -53,12 +53,16 @@ interface FileSystemEntry {
   owner?: string;
 }
 
+interface DirectoryScanResult {
+  root_path: string; 
+  entries: FileSystemEntry[];
+  scan_time_ms: number;
+}
+
 export function DirectoryScanner() {
   const [selectedPath, setSelectedPath] = useState<string>("");
   const [entries, setEntries] = useState<FileSystemEntry[]>([]);
-  const [displayedEntries, setDisplayedEntries] = useState<FileSystemEntry[]>(
-    []
-  );
+  const [displayedEntries, setDisplayedEntries] = useState<FileSystemEntry[]>([]);
   const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([]);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
@@ -72,6 +76,7 @@ export function DirectoryScanner() {
   const [totalSize, setTotalSize] = useState<number>(0);
   const [totalFiles, setTotalFiles] = useState<number>(0);
   const [freeSpace, setFreeSpace] = useState<string>("N/A");
+  const [scanTimeMs, setScanTimeMs] = useState<number>(0);
 
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
@@ -126,9 +131,9 @@ export function DirectoryScanner() {
 
     setDisplayedEntries(filtered);
 
-    // Build tree structure
-    buildTreeData(filtered);
-  }, [entries, filterValue]);
+    // Build tree structure using displayedEntries instead of filtered
+    buildTreeData(displayedEntries);
+  }, [entries, filterValue, displayedEntries]);
 
   // Sort entries
   const sortEntries = (
@@ -178,67 +183,16 @@ export function DirectoryScanner() {
     }
   };
 
-  // Set up event listeners for scan progress events
+  // Set up event listener for scan result event
   useEffect(() => {
-    let unlistenEntry: Promise<UnlistenFn>;
+    let unlistenResult: Promise<UnlistenFn>;
     let unlistenComplete: Promise<UnlistenFn>;
-    let bufferInterval: number | null = null;
 
     const setupListeners = async () => {
-      // Create a buffer to collect entries before updating state
-      let entriesBuffer: FileSystemEntry[] = [];
-
-      const processBuffer = () => {
-        if (entriesBuffer.length === 0) return;
-
-        setEntries((prevEntries) => {
-          // Create a map of the latest entries by path
-          const entryMap = new Map<string, FileSystemEntry>();
-
-          // First add all buffered entries to the map (duplicates will be overwritten)
-          entriesBuffer.forEach((entry) => {
-            entryMap.set(entry.path, entry);
-          });
-
-          // Create the updated entries array
-          const updatedEntries = [...prevEntries];
-
-          // Update or add entries from the buffer
-          entryMap.forEach((newEntry) => {
-            const existingEntryIndex = updatedEntries.findIndex(
-              (entry) => entry.path === newEntry.path
-            );
-
-            if (existingEntryIndex >= 0) {
-              // Update existing entry
-              updatedEntries[existingEntryIndex] = newEntry;
-            } else {
-              // Add new entry
-              updatedEntries.push(newEntry);
-            }
-          });
-
-          // Sort entries
-          const sortedEntries = sortEntries(updatedEntries, sortOrder, sortBy);
-
-          // Clear the buffer
-          entriesBuffer = [];
-
-          return sortedEntries;
-        });
-      };
-
-      const setupBufferProcessing = () => {
-        if (bufferInterval === null) {
-          bufferInterval = window.setInterval(processBuffer, 1000);
-        }
-      };
-
-      // Clean up any existing listeners first (important for Windows)
+      // Clean up any existing listeners first
       try {
         const cleanupListeners = async () => {
           try {
-            // Try to clean up any previous listeners that might still be active
             const dummyFn = await listen("dummy-event", () => {});
             dummyFn();
           } catch {
@@ -251,65 +205,25 @@ export function DirectoryScanner() {
         // Ignore cleanup errors
       }
 
-      unlistenEntry = listen<FileSystemEntry>("directory-entry", (event) => {
-        const newEntry = event.payload as FileSystemEntry;
-
-        setEntries((prevEntries) => {
-          // If we have fewer than 100 entries, update immediately
-          if (prevEntries.length < 10) {
-            const existingEntryIndex = prevEntries.findIndex(
-              (entry) => entry.path === newEntry.path
-            );
-
-            const updatedEntries =
-              existingEntryIndex >= 0
-                ? [...prevEntries]
-                : [...prevEntries, newEntry];
-
-            // If we found an existing entry, update it
-            if (existingEntryIndex >= 0) {
-              updatedEntries[existingEntryIndex] = newEntry;
-            }
-
-            // Sort entries
-            const sortedEntries = sortEntries(
-              updatedEntries,
-              sortOrder,
-              sortBy
-            );
-
-            // Clear the buffer
-            entriesBuffer = [];
-
-            return sortedEntries;
-          }
-
-          // If we have 100+ entries, use the buffer approach
-          entriesBuffer.push(newEntry);
-          setupBufferProcessing();
-
-          // If buffer reaches 10000 items, process it immediately
-          if (entriesBuffer.length >= 10000) {
-            processBuffer();
-          }
-
-          // Return unchanged state (buffer will update state later)
-          return prevEntries;
-        });
+      // Listen for the complete scan result
+      unlistenResult = listen<DirectoryScanResult>("scan-result", (event) => {
+        const result = event.payload as DirectoryScanResult;
+        
+        // Set scan time
+        setScanTimeMs(result.scan_time_ms);
+        
+        // Process all entries at once
+        const sortedEntries = sortEntries(result.entries, sortOrder, sortBy);
+        setEntries(sortedEntries);
+        
+        // Set scanning to false
+        setScanning(false);
       });
 
+      // Also listen for scan-complete for backward compatibility
       unlistenComplete = listen("scan-complete", () => {
-        // Process any remaining entries in the buffer
-        processBuffer();
-
-        // Clear the interval if it exists
-        if (bufferInterval !== null) {
-          clearInterval(bufferInterval);
-          bufferInterval = null;
-        }
-
         setScanning(false);
-
+        
         // Check free space
         if (selectedPath) {
           try {
@@ -333,16 +247,11 @@ export function DirectoryScanner() {
 
     return () => {
       // Clean up listeners when component unmounts
-      if (unlistenEntry) {
-        unlistenEntry.then((unlisten) => unlisten());
+      if (unlistenResult) {
+        unlistenResult.then((unlisten) => unlisten());
       }
       if (unlistenComplete) {
         unlistenComplete.then((unlisten) => unlisten());
-      }
-      // Clear the interval if it exists
-      if (bufferInterval !== null) {
-        clearInterval(bufferInterval);
-        bufferInterval = null;
       }
     };
   }, [selectedPath, sortOrder, sortBy]);
@@ -358,10 +267,10 @@ export function DirectoryScanner() {
       setError(null);
       setEntries([]);
       setDisplayedEntries([]);
+      setScanTimeMs(0);
       setScanning(true);
 
       // Force a small delay to ensure any pending operations complete
-      // This helps prevent issues on Windows
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // Invoke the Rust command to scan the directory
@@ -539,13 +448,6 @@ export function DirectoryScanner() {
       if (parent && parent.children) {
         // Add to parent's children
         parent.children.push(item);
-
-        // Update parent's file and folder counts
-        if (item.type === "directory") {
-          parent.folderCount += item.folderCount;
-        } else {
-          parent.fileCount += 1;
-        }
 
         // Calculate percentage of parent
         item.percentOfParent =
@@ -804,12 +706,13 @@ export function DirectoryScanner() {
         <div>
           {scanning && (
             <span className="text-muted-foreground animate-pulse">
-              Scanning... {displayedEntries.length} entries found
+              Scanning... Please wait
             </span>
           )}
           {!scanning && treeData.length > 0 && (
             <span>
               {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
+              {scanTimeMs > 0 && ` (scanned in ${(scanTimeMs / 1000).toFixed(2)}s)`}
             </span>
           )}
         </div>
