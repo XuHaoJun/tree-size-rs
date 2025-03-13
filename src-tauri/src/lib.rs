@@ -51,6 +51,26 @@ struct FileSystemEntry {
     directory_count: u64,
 }
 
+// Get parent directories up to but not beyond the target directory
+fn get_parent_chain_sync(path: &Path, target_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut chain = Vec::with_capacity(10); // Pre-allocate for typical directory depth
+    let mut current = path;
+    
+    while let Some(parent) = current.parent() {
+        // If we've reached the target directory, stop collecting parents
+        if let Some(target) = target_dir {
+            if parent == target || !parent.starts_with(target) {
+                break;
+            }
+        }
+        
+        chain.push(parent.to_path_buf());
+        current = parent;
+    }
+    
+    chain
+}
+
 // Asynchronous recursive processing function
 async fn calculate_size_async(
     path: PathBuf,
@@ -59,13 +79,75 @@ async fn calculate_size_async(
     target_dir_path: Option<PathBuf>,
     visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
 ) -> std::io::Result<()> {
-    // Check if path is a symlink
-    let is_symlink = path.is_symlink();
+    // Use a shared visited_inodes set to track cycles
+    let visited = visited_inodes.unwrap_or_else(|| Arc::new(DashSet::new()));
     
-    if is_symlink {
-        // Only count the symlink itself, not what it points to
+    // Check if path is a symlink first - handle this case separately
+    if path.is_symlink() {
         if let Some(path_info) = platform::get_path_info(&path, true, false) {
-            update_analytics(&path, path_info.size, 1, 0, 0, &analytics_map, &sender);
+            // For symlinks, add entry to analytics map with correct counts
+            // Symlinks count as entries but not as files or directories
+            let symlink_analytics = Arc::new(AnalyticsInfo {
+                size_bytes: AtomicU64::new(path_info.size),
+                entry_count: AtomicU64::new(1), // Count as 1 entry
+                file_count: AtomicU64::new(0),  // Not a file
+                directory_count: AtomicU64::new(0), // Not a directory
+            });
+            
+            // Add the symlink to the map
+            analytics_map.insert(path.clone(), symlink_analytics.clone());
+            
+            // Send event for the symlink
+            if let Some(sender) = &sender {
+                let _ = sender.send(FileSystemEntry {
+                    path: path.clone(),
+                    size_bytes: path_info.size,
+                    entry_count: 1,
+                    file_count: 0,
+                    directory_count: 0,
+                });
+            }
+            
+            // Update parent directories if this is not the target directory
+            if !matches!(&target_dir_path, Some(target) if path == *target) {
+                let parent_chain = get_parent_chain_sync(&path, target_dir_path.as_deref());
+                for parent in parent_chain {
+                    match analytics_map.entry(parent.clone()) {
+                        dashmap::mapref::entry::Entry::Occupied(e) => {
+                            let analytics = e.get();
+                            analytics.size_bytes.fetch_add(path_info.size, Ordering::Relaxed);
+                            analytics.entry_count.fetch_add(1, Ordering::Relaxed);
+                            // Do NOT increment file or directory counts for symlinks
+                            
+                            if let Some(sender) = &sender {
+                                let _ = sender.send(FileSystemEntry {
+                                    path: parent.clone(),
+                                    size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
+                                    entry_count: analytics.entry_count.load(Ordering::Relaxed),
+                                    file_count: analytics.file_count.load(Ordering::Relaxed),
+                                    directory_count: analytics.directory_count.load(Ordering::Relaxed),
+                                });
+                            }
+                        },
+                        dashmap::mapref::entry::Entry::Vacant(e) => {
+                            let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size, true));
+                            e.insert(analytics.clone());
+                            
+                            if let Some(sender) = &sender {
+                                let _ = sender.send(FileSystemEntry {
+                                    path: parent.clone(),
+                                    size_bytes: path_info.size,
+                                    entry_count: 1,
+                                    file_count: 0,
+                                    directory_count: 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return Ok(());
         }
         return Ok(());
     }
@@ -78,9 +160,7 @@ async fn calculate_size_async(
     
     // Check for cycles using device and inode numbers if available
     if let Some(inode_pair) = path_info.inode_device {
-        let visited = visited_inodes.clone().unwrap_or_else(|| Arc::new(DashSet::new()));
-        
-        // If we've seen this inode before, we have a cycle
+        // If we've seen this inode before and it's a directory, we have a cycle
         if !visited.insert(inode_pair) && path_info.is_dir {
             return Ok(());
         }
@@ -90,138 +170,172 @@ async fn calculate_size_async(
     let file_count = if path_info.is_dir { 0 } else { 1 };
     let directory_count = if path_info.is_dir { 1 } else { 0 };
 
-    // Handle updates directly
-    let mut updates = vec![];
-    if path_info.is_dir {
-        match analytics_map.entry(path.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(e) => {
-                updates.push((e.get().clone(), path_info.size, entry_count, file_count, directory_count, path.clone()));
-            }
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size, path_info.is_dir));
-                updates.push((analytics.clone(), 0, 0, 0, 0, path.clone()));
-                e.insert(analytics);
-            }
-        }
-    }
     // Skip parent size calculation if this is the target directory
     let is_target_dir = match &target_dir_path {
         Some(target) => path == *target,
         None => false,
     };
 
-    if !is_target_dir {
-        // Update parent directories
-        let parent_chain = get_parent_chain_sync(&path);
-        for parent in parent_chain {
-            // Skip if parent is not in map
-            if let Some(analytics) = analytics_map.get(&parent) {
-                analytics.size_bytes.fetch_add(path_info.size, Ordering::Relaxed);
-                analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
-                analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
-                analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
-                
-                // Send parent path and values to channel if available
-                if let Some(sender) = &sender {
-                    let _ = sender.send(FileSystemEntry {
-                        path: parent.clone(),
-                        size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
-                        entry_count: analytics.entry_count.load(Ordering::Relaxed),
-                        file_count: analytics.file_count.load(Ordering::Relaxed),
-                        directory_count: analytics.directory_count.load(Ordering::Relaxed),
-                    });
-                }
+    // For directories, process all children before updating parent directories
+    if path_info.is_dir {
+        // Add directory to analytics map first
+        let dir_analytics = match analytics_map.entry(path.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size, true));
+                e.insert(analytics.clone());
+                analytics
+            }
+        };
+        
+        // Collect all subdirectory entries first
+        let mut entries = Vec::new();
+        let mut read_dir_result = fs::read_dir(&path).await;
+        
+        if let Ok(ref mut children) = read_dir_result {
+            while let Some(entry) = children.next_entry().await? {
+                entries.push(entry.path());
             }
         }
-    }
-
-    // Process updates
-    for (analytics, size, count, file_count, directory_count, path) in updates {
-        analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
-        analytics.entry_count.fetch_add(count, Ordering::Relaxed);
-        analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
-        analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
         
-        // Send path and values to channel if available
-        if let Some(sender) = &sender {
-            let _ = sender.send(FileSystemEntry {
-                path: path,
-                size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
-                entry_count: analytics.entry_count.load(Ordering::Relaxed),
-                file_count: analytics.file_count.load(Ordering::Relaxed),
-                directory_count: analytics.directory_count.load(Ordering::Relaxed),
-            });
-        }
-    }
-
-    // Process subdirectories asynchronously
-    if path_info.is_dir {
-        let mut entries = Vec::new();
-        let mut children = fs::read_dir(&path).await?;
-
-        // Create visited_inodes set if it doesn't exist
-        let visited = visited_inodes.clone().unwrap_or_else(|| Arc::new(DashSet::new()));
-
-        // Collect all subdirectory entries
-        while let Some(entry) = children.next_entry().await? {
-            entries.push(entry.path());
-        }
-
-        // Process each subdirectory sequentially but asynchronously
-        for child_path in entries {
-            // Use Box::pin to handle recursive async calls
+        // Use a more efficient batch processing approach
+        let mut total_size = path_info.size;
+        let mut total_entries = 1; // Count current directory
+        let mut total_files = 0;
+        let mut total_dirs = 1; // Count current directory
+        
+        // Process children sequentially to avoid threading issues
+        for child_path in &entries {
+            // Use Box::pin to handle recursive async calls correctly
             let future = Box::pin(calculate_size_async(
-                child_path,
+                child_path.clone(),
                 analytics_map.clone(),
                 sender.clone(),
                 target_dir_path.clone(),
                 Some(visited.clone()),
             ));
-            future.await?;
+            
+            // Await the future
+            if let Err(e) = future.await {
+                eprintln!("Error processing {:?}: {:?}", child_path, e);
+            }
+        }
+        
+        // After processing all children, update the directory size with the sum of all children
+        for child_path in &entries {
+            if let Some(child_analytics) = analytics_map.get(child_path) {
+                // Accumulate child statistics
+                total_size += child_analytics.size_bytes.load(Ordering::Relaxed);
+                total_entries += child_analytics.entry_count.load(Ordering::Relaxed);
+                total_files += child_analytics.file_count.load(Ordering::Relaxed);
+                total_dirs += child_analytics.directory_count.load(Ordering::Relaxed);
+            }
+        }
+        
+        // Update directory size and counts
+        dir_analytics.size_bytes.store(total_size, Ordering::Relaxed);
+        dir_analytics.entry_count.store(total_entries, Ordering::Relaxed);
+        dir_analytics.file_count.store(total_files, Ordering::Relaxed);
+        dir_analytics.directory_count.store(total_dirs, Ordering::Relaxed);
+        
+        // Send updated directory information
+        if let Some(sender) = &sender {
+            let _ = sender.send(FileSystemEntry {
+                path: path.clone(),
+                size_bytes: total_size,
+                entry_count: total_entries,
+                file_count: total_files,
+                directory_count: total_dirs,
+            });
+        }
+    } else {
+        // For regular files, add to analytics map
+        match analytics_map.entry(path.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                let analytics = e.get();
+                analytics.size_bytes.store(path_info.size, Ordering::Relaxed);
+                analytics.entry_count.store(1, Ordering::Relaxed);
+                analytics.file_count.store(1, Ordering::Relaxed);
+                analytics.directory_count.store(0, Ordering::Relaxed);
+            },
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let analytics = Arc::new(AnalyticsInfo::new_with_size(path_info.size, false));
+                e.insert(analytics);
+            }
+        }
+        
+        // Send file information
+        if let Some(sender) = &sender {
+            let _ = sender.send(FileSystemEntry {
+                path: path.clone(),
+                size_bytes: path_info.size,
+                entry_count: 1,
+                file_count: 1,
+                directory_count: 0,
+            });
+        }
+    }
+    
+    // Update parent directories if this is not the target directory
+    if !is_target_dir {
+        let size = if path_info.is_dir {
+            // For directories, get the accumulated size after processing children
+            if let Some(analytics) = analytics_map.get(&path) {
+                analytics.size_bytes.load(Ordering::Relaxed)
+            } else {
+                path_info.size
+            }
+        } else {
+            path_info.size
+        };
+        
+        let parent_chain = get_parent_chain_sync(&path, target_dir_path.as_deref());
+        for parent in parent_chain {
+            // Skip if parent is not in map
+            match analytics_map.entry(parent.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(e) => {
+                    let analytics = e.get();
+                    analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
+                    analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
+                    analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
+                    analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
+                    
+                    // Send parent path and values to channel if available
+                    if let Some(sender) = &sender {
+                        let _ = sender.send(FileSystemEntry {
+                            path: parent.clone(),
+                            size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
+                            entry_count: analytics.entry_count.load(Ordering::Relaxed),
+                            file_count: analytics.file_count.load(Ordering::Relaxed),
+                            directory_count: analytics.directory_count.load(Ordering::Relaxed),
+                        });
+                    }
+                },
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    // Create entry for parent if it doesn't exist
+                    let analytics = Arc::new(AnalyticsInfo::new_with_size(0, true));
+                    analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
+                    analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
+                    analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
+                    analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
+                    e.insert(analytics.clone());
+                    
+                    // Send parent path and values to channel if available
+                    if let Some(sender) = &sender {
+                        let _ = sender.send(FileSystemEntry {
+                            path: parent.clone(),
+                            size_bytes: size,
+                            entry_count: entry_count,
+                            file_count: file_count,
+                            directory_count: directory_count,
+                        });
+                    }
+                }
+            }
         }
     }
 
     Ok(())
-}
-
-// Helper function to update analytics and send events
-fn update_analytics(
-    path: &Path, 
-    size: u64,
-    entry_count: u64,
-    file_count: u64,
-    directory_count: u64,
-    analytics_map: &Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
-    sender: &Option<kanal::Sender<FileSystemEntry>>
-) {
-    if let Some(analytics) = analytics_map.get(path) {
-        analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
-        analytics.entry_count.fetch_add(entry_count, Ordering::Relaxed);
-        analytics.file_count.fetch_add(file_count, Ordering::Relaxed);
-        analytics.directory_count.fetch_add(directory_count, Ordering::Relaxed);
-        
-        // Send path and values to channel if available
-        if let Some(sender) = sender {
-            let _ = sender.send(FileSystemEntry {
-                path: path.to_path_buf(),
-                size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
-                entry_count: analytics.entry_count.load(Ordering::Relaxed),
-                file_count: analytics.file_count.load(Ordering::Relaxed),
-                directory_count: analytics.directory_count.load(Ordering::Relaxed),
-            });
-        }
-    }
-}
-
-// 同步版本的获取父目录链函数，用于 Rayon 并行处理
-fn get_parent_chain_sync(path: &Path) -> Vec<PathBuf> {
-    let mut chain = vec![];
-    let mut current = path;
-    while let Some(parent) = current.parent() {
-        chain.push(parent.to_path_buf());
-        current = parent;
-    }
-    chain
 }
 
 // New command to stream directory sizes to the frontend
