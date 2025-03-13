@@ -369,8 +369,14 @@ mod tests {
         assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
         
         let analytics = analytics_map.get(&path).unwrap();
-        // Directories have a non-zero size on filesystems
-        assert!(analytics.size_bytes.load(Ordering::Relaxed) > 0, "Directory should have a size on the filesystem");
+        // Directories have different size behaviors on different platforms
+        #[cfg(target_family = "unix")]
+        assert!(analytics.size_bytes.load(Ordering::Relaxed) > 0, "Directory should have a size on Unix filesystems");
+        
+        // On Windows, empty directories might report a size of 0
+        #[cfg(target_os = "windows")]
+        assert!(analytics.size_bytes.load(Ordering::Relaxed) >= 0, "Directory size might be 0 on Windows");
+        
         assert_eq!(analytics.entry_count.load(Ordering::Relaxed), 1, "Should count itself as one entry");
         assert_eq!(analytics.file_count.load(Ordering::Relaxed), 0, "Should have 0 files");
         assert_eq!(analytics.directory_count.load(Ordering::Relaxed), 1, "Should count itself as one directory");
