@@ -554,15 +554,13 @@ mod tests {
             Some(visited_inodes),
         ).await?;
         
-        // Drop sender to close the channel
-        drop(analytics_map);
         
         // Count received events
         let mut entries_received = 0;
         while let Ok(_) = receiver.recv() {
             entries_received += 1;
         }
-        
+
         // Verify we received events
         assert!(entries_received > 0, "Should have received events for paths");
         
