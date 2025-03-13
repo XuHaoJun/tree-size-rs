@@ -338,3 +338,238 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_calculate_size_empty_directory() -> std::io::Result<()> {
+        // Create a temporary directory for testing
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().to_path_buf();
+        
+        // Create analytics map and visited inodes
+        let analytics_map = Arc::new(DashMap::new());
+        let visited_inodes = Arc::new(DashSet::new());
+        
+        // Run the function
+        calculate_size_async(
+            path.clone(),
+            analytics_map.clone(),
+            None, // No sender needed for this test
+            None, // No target directory
+            Some(visited_inodes),
+        ).await?;
+        
+        // Verify the results
+        assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
+        
+        let analytics = analytics_map.get(&path).unwrap();
+        // Directories have different size behaviors on different platforms
+        #[cfg(target_family = "unix")]
+        assert!(analytics.size_bytes.load(Ordering::Relaxed) > 0, "Directory should have a size on Unix filesystems");
+        
+        // On Windows, empty directories might report a size of 0
+        #[cfg(target_os = "windows")]
+        assert!(analytics.size_bytes.load(Ordering::Relaxed) >= 0, "Directory size might be 0 on Windows");
+        
+        assert_eq!(analytics.entry_count.load(Ordering::Relaxed), 1, "Should count itself as one entry");
+        assert_eq!(analytics.file_count.load(Ordering::Relaxed), 0, "Should have 0 files");
+        assert_eq!(analytics.directory_count.load(Ordering::Relaxed), 1, "Should count itself as one directory");
+        
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_calculate_size_with_files() -> std::io::Result<()> {
+        // Create a temporary directory with files
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().to_path_buf();
+        
+        // Create a file with known content
+        let file_path = path.join("test_file.txt");
+        let mut file = File::create(&file_path)?;
+        let test_data = "Hello, world!";
+        file.write_all(test_data.as_bytes())?;
+        
+        // Create analytics map and visited inodes
+        let analytics_map = Arc::new(DashMap::new());
+        let visited_inodes = Arc::new(DashSet::new());
+        
+        // Run the function
+        calculate_size_async(
+            path.clone(),
+            analytics_map.clone(),
+            None,
+            None,
+            Some(visited_inodes),
+        ).await?;
+        
+        // Verify the results
+        assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
+        
+        let analytics = analytics_map.get(&path).unwrap();
+        assert!(analytics.size_bytes.load(Ordering::Relaxed) >= test_data.len() as u64, 
+            "Directory size should include the file size");
+        assert_eq!(analytics.entry_count.load(Ordering::Relaxed), 2, "Should count itself and one file");
+        assert_eq!(analytics.file_count.load(Ordering::Relaxed), 1, "Should have 1 file");
+        assert_eq!(analytics.directory_count.load(Ordering::Relaxed), 1, "Should count itself as one directory");
+        
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_calculate_size_with_subdirectories() -> std::io::Result<()> {
+        // Create a temporary directory with subdirectories and files
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().to_path_buf();
+        
+        // Create a subdirectory
+        let subdir_path = path.join("subdir");
+        fs::create_dir(&subdir_path)?;
+        
+        // Create a file in the subdirectory
+        let file_path = subdir_path.join("test_file.txt");
+        let mut file = File::create(&file_path)?;
+        let test_data = "Hello, nested world!";
+        file.write_all(test_data.as_bytes())?;
+        
+        // Create another file in the root directory
+        let root_file_path = path.join("root_file.txt");
+        let mut root_file = File::create(&root_file_path)?;
+        let root_test_data = "Root data";
+        root_file.write_all(root_test_data.as_bytes())?;
+        
+        // Create analytics map and visited inodes
+        let analytics_map = Arc::new(DashMap::new());
+        let visited_inodes = Arc::new(DashSet::new());
+        
+        // Run the function
+        calculate_size_async(
+            path.clone(),
+            analytics_map.clone(),
+            None,
+            None,
+            Some(visited_inodes),
+        ).await?;
+        
+        // Verify the results for the root directory
+        assert!(analytics_map.contains_key(&path), "Root path should be in the analytics map");
+        
+        let root_analytics = analytics_map.get(&path).unwrap();
+        let expected_size = (test_data.len() + root_test_data.len()) as u64;
+        assert!(root_analytics.size_bytes.load(Ordering::Relaxed) >= expected_size, 
+            "Directory size should include all files and subdirectories");
+        assert_eq!(root_analytics.entry_count.load(Ordering::Relaxed), 4, 
+            "Should count root dir, subdir, and 2 files");
+        assert_eq!(root_analytics.file_count.load(Ordering::Relaxed), 2, "Should have 2 files");
+        assert_eq!(root_analytics.directory_count.load(Ordering::Relaxed), 2, 
+            "Should count root and subdirectory");
+        
+        // Verify the results for the subdirectory
+        assert!(analytics_map.contains_key(&subdir_path), "Subdir path should be in the analytics map");
+        
+        let subdir_analytics = analytics_map.get(&subdir_path).unwrap();
+        assert!(subdir_analytics.size_bytes.load(Ordering::Relaxed) >= test_data.len() as u64, 
+            "Subdirectory size should include its file size");
+        assert_eq!(subdir_analytics.entry_count.load(Ordering::Relaxed), 2, 
+            "Should count subdir and its file");
+        assert_eq!(subdir_analytics.file_count.load(Ordering::Relaxed), 1, "Should have 1 file");
+        assert_eq!(subdir_analytics.directory_count.load(Ordering::Relaxed), 1, 
+            "Should count itself as one directory");
+        
+        Ok(())
+    }
+    
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn test_calculate_size_with_symlink() -> std::io::Result<()> {
+        // Create a temporary directory with a symlink
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().to_path_buf();
+        
+        // Create a file with known content
+        let file_path = path.join("test_file.txt");
+        let mut file = File::create(&file_path)?;
+        let test_data = "Hello, world!";
+        file.write_all(test_data.as_bytes())?;
+        
+        // Create a symlink to the file
+        let symlink_path = path.join("test_symlink");
+        std::os::unix::fs::symlink(&file_path, &symlink_path)?;
+        
+        // Create analytics map and visited inodes
+        let analytics_map = Arc::new(DashMap::new());
+        let visited_inodes = Arc::new(DashSet::new());
+        
+        // Run the function
+        calculate_size_async(
+            path.clone(),
+            analytics_map.clone(),
+            None,
+            None,
+            Some(visited_inodes),
+        ).await?;
+        
+        // Verify the results
+        assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
+        
+        let analytics = analytics_map.get(&path).unwrap();
+        // The symlink is counted in the entry count, but not as a file
+        // In some implementations, symlinks might be treated differently
+        assert!(analytics.entry_count.load(Ordering::Relaxed) >= 2, 
+            "Should count at least the directory and file");
+        assert_eq!(analytics.file_count.load(Ordering::Relaxed), 1, 
+            "Should count only the actual file, not the symlink as a file");
+        
+        // Let's also check that the symlink exists
+        assert!(symlink_path.exists(), "Symlink should exist");
+        
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_calculate_size_with_events() -> std::io::Result<()> {
+        // Create a temporary directory with files
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().to_path_buf();
+        
+        // Create a file with known content
+        let file_path = path.join("test_file.txt");
+        let mut file = File::create(&file_path)?;
+        let test_data = "Hello, world!";
+        file.write_all(test_data.as_bytes())?;
+        
+        // Create a channel to receive events
+        let (sender, receiver) = kanal::bounded::<FileSystemEntry>(100);
+        
+        // Create analytics map and visited inodes
+        let analytics_map = Arc::new(DashMap::new());
+        let visited_inodes = Arc::new(DashSet::new());
+        
+        // Run the function
+        calculate_size_async(
+            path.clone(),
+            analytics_map.clone(),
+            Some(sender),
+            None,
+            Some(visited_inodes),
+        ).await?;
+        
+        
+        // Count received events
+        let mut entries_received = 0;
+        while let Ok(_) = receiver.recv() {
+            entries_received += 1;
+        }
+
+        // Verify we received events
+        assert!(entries_received > 0, "Should have received events for paths");
+        
+        Ok(())
+    }
+}
