@@ -480,6 +480,7 @@ mod tests {
     }
     
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore)]
     async fn test_calculate_size_with_symlink() -> std::io::Result<()> {
         // Skip this test on Windows as symlink creation requires admin privileges
         if cfg!(windows) {
