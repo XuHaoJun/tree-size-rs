@@ -20,6 +20,7 @@ pub struct PathInfo {
     /// Inode and device information for detecting cycles (Unix) or file/volume ID (Windows)
     pub inode_device: Option<(u64, u64)>,
     /// File modification/access/creation times
+    #[allow(dead_code)]
     pub times: (i64, i64, i64),
     /// Whether the path is a directory
     pub is_dir: bool,

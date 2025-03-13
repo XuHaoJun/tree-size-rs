@@ -34,13 +34,50 @@ In this session, we optimized a Rust directory size analyzer by learning from "d
 - Improved cleanup of resources to prevent memory leaks 
 - Used atomic operations more efficiently for counter updates
 
+### 6. Directory Size Calculation
+- Fixed inconsistent directory size calculation
+- Addressed fluctuating size values during processing
+- Enhanced validation to detect unusually large child directories
+- Added debug logging to diagnose size calculation issues
+
+### 7. Event Handling System
+- Redesigned event emission to prevent fluctuating values
+- Implemented tree-based structure directly in Rust
+- Created a collective event system that sends all data at once
+- Improved frontend stability by eliminating incremental updates
+
+### 8. Tree-Based Structure
+- Added `FileSystemTreeNode` structure in Rust backend
+- Implemented efficient tree-building algorithm using HashMaps
+- Pre-calculated percentages and sorted children by size directly in Rust
+- Built parent-child relationships in a single pass for better performance
+
+### 9. Frontend Enhancements
+- Updated frontend to work with new tree structure
+- Improved filtering mechanism to operate directly on tree nodes
+- Added auto-expansion of filtered results for better UX
+- Simplified frontend logic by offloading tree construction to Rust
+
+### 10. Enhanced Symlink Processing
+- Fixed file counting in directories containing symlinks
+- Implemented separate handling for direct files vs. symlinks in directories
+- Added special case for symlinks to count them as entries only, not as files/directories
+- Resolved test failures in `test_calculate_size_with_symlink` by correctly counting real files
+- Improved child entry detection to distinguish between real files and symlinks
+- Made code more resilient to various filesystem configurations with symlinks
+
 ## Testing
 - Resolved failing test case `test_calculate_size_with_symlink`
 - Ensured proper counting of files, directories, and symlinks
+- Fixed borrowing issues in the tree-building function
+- Added comprehensive tests for symlink handling edge cases
 
 ## Discussion Points
 - Considered converting `get_parent_chain_sync` to async but determined it wasn't beneficial
 - Explored parallelization strategies from the dust codebase
 - Debated memory vs. speed tradeoffs in various optimization approaches
+- Addressed Rust borrowing challenges in tree-building algorithm
+- Compared frontend vs. backend processing performance
+- Discussed platform-specific considerations for symlink handling (Unix vs. Windows)
 
-The final implementation is more robust, correctly handles edge cases, and follows patterns from established tools in the Rust ecosystem.
+The final implementation is significantly more robust and efficient, featuring a complete redesign of the event system and directory tree construction. By moving complex operations from JavaScript to Rust, we achieved better performance, especially for large directories with thousands of entries. The application now provides a more responsive user experience with stable, accurate data representation.

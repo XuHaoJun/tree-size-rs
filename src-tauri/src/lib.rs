@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 use dashmap::{DashMap, DashSet};
 use serde::Serialize;
-use kanal;
 use tauri::Emitter;
+use std::collections::HashMap;
 
 /// Contains analytics information for a directory or file
 #[derive(Debug)]
@@ -23,6 +23,7 @@ struct AnalyticsInfo {
 }
 
 impl AnalyticsInfo {
+    #[allow(dead_code)]
     fn new_with_size(size: u64, is_dir: bool) -> Self {
         let file_count = if is_dir { 0 } else { 1 };
         let directory_count = if is_dir { 1 } else { 0 };
@@ -51,13 +52,36 @@ struct FileSystemEntry {
     directory_count: u64,
 }
 
-/// Complete scan result with all directory entries
+/// Represents a node in the file system tree
+#[derive(Clone, Debug, Serialize)]
+struct FileSystemTreeNode {
+    /// Path to the file or directory
+    path: PathBuf,
+    /// Name of the file or directory (just the filename, not the full path)
+    name: String,
+    /// Size in bytes
+    size_bytes: u64,
+    /// Number of entries (files and directories)
+    entry_count: u64,
+    /// Number of files
+    file_count: u64,
+    /// Number of directories
+    directory_count: u64,
+    /// Percentage of parent size (0-100)
+    percent_of_parent: f64,
+    /// Child nodes
+    children: Vec<FileSystemTreeNode>,
+}
+
+/// Complete scan result with tree representation
 #[derive(Clone, Debug, Serialize)]
 struct DirectoryScanResult {
     /// The root directory path
     root_path: PathBuf,
-    /// All entries found during the scan
+    /// All entries found during the scan (flat list)
     entries: Vec<FileSystemEntry>,
+    /// Tree representation of the directory structure
+    tree: FileSystemTreeNode,
     /// Total scan time in milliseconds
     scan_time_ms: u64,
 }
@@ -178,6 +202,16 @@ async fn calculate_size_async(
         
         // Sum up all children's contributions
         for child_path in &entries {
+            // Check if the child is a direct file (not a symlink pointing to a file)
+            let child_is_file = child_path.is_file() && !child_path.is_symlink();
+            
+            // Update counts for direct files first
+            if child_is_file {
+                total_files += 1;
+                total_entries += 1;
+            }
+            
+            // Get analytics info for the child if it exists
             if let Some(child_analytics) = analytics_map.get(child_path) {
                 let child_size = child_analytics.size_bytes.load(Ordering::Relaxed);
                 let child_entries = child_analytics.entry_count.load(Ordering::Relaxed);
@@ -185,9 +219,18 @@ async fn calculate_size_async(
                 let child_dirs = child_analytics.directory_count.load(Ordering::Relaxed);
                 
                 total_size += child_size;
-                total_entries += child_entries;
-                total_files += child_files;
-                total_dirs += child_dirs;
+                
+                // For symlinks, count the entry but not as file/dir
+                if child_path.is_symlink() {
+                    total_entries += 1; // Count the symlink as an entry
+                } else {
+                    // For non-symlinks, add all the counts
+                    if !child_is_file { // Avoid double counting files we already counted
+                        total_entries += child_entries;
+                        total_files += child_files;
+                    }
+                    total_dirs += child_dirs;
+                }
             }
         }
         
@@ -251,6 +294,89 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         .collect()
 }
 
+// This function builds a tree from the flat list of entries
+fn build_tree_from_entries(entries: &[FileSystemEntry], root_path: &Path) -> FileSystemTreeNode {
+    // Create a map of path -> entry for quick lookups
+    let path_map: HashMap<PathBuf, &FileSystemEntry> = entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    
+    // Create a map of parent path -> child paths
+    let mut children_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    
+    // Find the root node and build the parent-child relationships
+    let mut root_entry = None;
+    
+    for entry in entries {
+        if entry.path == root_path {
+            root_entry = Some(entry);
+            continue;
+        }
+        
+        if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+            children_map.entry(parent_path).or_default().push(entry.path.clone());
+        }
+    }
+    
+    // Use the first entry if root not found
+    let root_entry = root_entry.unwrap_or_else(|| entries.first().unwrap_or_else(|| {
+        panic!("No entries found to build tree");
+    }));
+    
+    // Recursive function to build the tree
+    fn build_node(
+        path: &Path, 
+        entry: &FileSystemEntry,
+        children_map: &HashMap<PathBuf, Vec<PathBuf>>,
+        path_map: &HashMap<PathBuf, &FileSystemEntry>
+    ) -> FileSystemTreeNode {
+        // Extract name from path
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        // Get children for this path
+        let mut children = Vec::new();
+        if let Some(child_paths) = children_map.get(&entry.path) {
+            for child_path in child_paths {
+                if let Some(child_entry) = path_map.get(child_path) {
+                    let child_node = build_node(child_path, child_entry, children_map, path_map);
+                    children.push(child_node);
+                }
+            }
+            
+            // Sort children by size (largest first)
+            children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        }
+        
+        // Calculate percentages for children
+        let parent_size = entry.size_bytes;
+        for child in &mut children {
+            if parent_size > 0 {
+                child.percent_of_parent = (child.size_bytes as f64 / parent_size as f64) * 100.0;
+            } else {
+                child.percent_of_parent = 0.0;
+            }
+        }
+        
+        FileSystemTreeNode {
+            path: entry.path.clone(),
+            name,
+            size_bytes: entry.size_bytes,
+            entry_count: entry.entry_count,
+            file_count: entry.file_count,
+            directory_count: entry.directory_count,
+            percent_of_parent: 100.0, // Default value, will be updated by parent
+            children,
+        }
+    }
+    
+    // Build the tree starting from the root
+    build_node(&root_entry.path, root_entry, &children_map, &path_map)
+}
+
 // New command to scan directory and return complete results at once
 #[tauri::command]
 async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), String> {
@@ -300,10 +426,14 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     // Convert the analytics map to a vector of entries
     let entries = analytics_map_to_entries(&analytics_map);
     
+    // Build the tree from the entries
+    let tree = build_tree_from_entries(&entries, &target_dir);
+    
     // Create the complete result object
     let result = DirectoryScanResult {
         root_path: target_dir,
         entries,
+        tree,
         scan_time_ms: elapsed_ms,
     };
     
