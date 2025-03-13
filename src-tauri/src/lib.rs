@@ -480,13 +480,8 @@ mod tests {
     }
     
     #[tokio::test]
-    #[cfg_attr(target_os = "windows", ignore)]
+    #[cfg(not(target_os = "windows"))]
     async fn test_calculate_size_with_symlink() -> std::io::Result<()> {
-        // Skip this test on Windows as symlink creation requires admin privileges
-        if cfg!(windows) {
-            return Ok(());
-        }
-        
         // Create a temporary directory with a symlink
         let temp_dir = tempdir()?;
         let path = temp_dir.path().to_path_buf();
