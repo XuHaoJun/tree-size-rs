@@ -16,6 +16,7 @@ import {
   Settings,
   HelpCircle,
   FolderOpen,
+  LoaderIcon
 } from "lucide-react";
 import {
   Tooltip,
@@ -721,7 +722,7 @@ function TreeSizeItem({
         >
           {item.type === "directory" &&
             (isLoading ? (
-              <span className="animate-spin h-4 w-4">⟳</span>
+              <LoaderIcon className="h-4 w-4 animate-spin" />
             ) : expanded ? (
               <ChevronDown className="h-4 w-4" />
             ) : (
