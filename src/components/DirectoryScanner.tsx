@@ -11,8 +11,6 @@ import {
   Folder,
   Percent,
   AlignJustify,
-  SortAsc,
-  SortDesc,
   ChevronRight,
   ChevronDown,
   Settings,
@@ -26,7 +24,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Input } from "@/components/ui/input";
 
 // Extend the TreeViewItem interface to include size data
 interface EnhancedTreeViewItem extends BaseTreeViewItem {
@@ -75,14 +72,10 @@ interface DirectoryScanResult {
 
 export function DirectoryScanner() {
   const [selectedPath, setSelectedPath] = useState<string>("");
-  const [entries, setEntries] = useState<FileSystemEntry[]>([]);
   const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([]);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
-  const [sortBy, setSortBy] = useState<"size" | "count">("size");
-  const [filterValue, setFilterValue] = useState("");
   const [currentTab, setCurrentTab] = useState<
     "file" | "home" | "scan" | "view" | "options" | "help"
   >("scan");
@@ -90,7 +83,6 @@ export function DirectoryScanner() {
   const [totalFiles, setTotalFiles] = useState<number>(0);
   const [freeSpace, setFreeSpace] = useState<string>("N/A");
   const [scanTimeMs, setScanTimeMs] = useState<number>(0);
-  const [filteredTreeData, setFilteredTreeData] = useState<EnhancedTreeViewItem[]>([]);
 
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
@@ -192,7 +184,6 @@ export function DirectoryScanner() {
           
           // Update loading state in the tree
           setTreeData((prevData) => updateLoadingState(prevData, itemId, true));
-          setFilteredTreeData((prevData) => updateLoadingState(prevData, itemId, true));
           
           // Load children asynchronously
           loadDirectoryChildren(itemId).catch((err) => {
@@ -201,7 +192,6 @@ export function DirectoryScanner() {
             
             // Update loading state in the tree (set to false)
             setTreeData((prevData) => updateLoadingState(prevData, itemId, false));
-            setFilteredTreeData((prevData) => updateLoadingState(prevData, itemId, false));
           });
         }
         
@@ -254,7 +244,6 @@ export function DirectoryScanner() {
 
       // Update tree data with new children
       setTreeData((prevData) => updateTreeWithChildren(prevData, directoryId, children));
-      setFilteredTreeData((prevData) => updateTreeWithChildren(prevData, directoryId, children));
 
     } catch (err) {
       console.error("Error loading directory children:", err);
@@ -293,7 +282,6 @@ export function DirectoryScanner() {
           
           // Update loading state in the tree (set to false)
           setTreeData((prevData) => updateLoadingState(prevData, directoryId, false));
-          setFilteredTreeData((prevData) => updateLoadingState(prevData, directoryId, false));
           
           // Attempt to rescan
           try {
@@ -334,82 +322,6 @@ export function DirectoryScanner() {
     };
   };
 
-  // Filter the tree data based on the filter value
-  useEffect(() => {
-    if (!treeData.length || !filterValue.trim()) {
-      setFilteredTreeData(treeData);
-      return;
-    }
-
-    const filterTree = (items: EnhancedTreeViewItem[]): EnhancedTreeViewItem[] => {
-      return items
-        .map(item => {
-          // Check if this item matches the filter
-          const matches = item.name.toLowerCase().includes(filterValue.toLowerCase()) ||
-                         item.id.toLowerCase().includes(filterValue.toLowerCase());
-          
-          // If it has children, filter them too
-          const filteredChildren = item.children 
-            ? filterTree(item.children as EnhancedTreeViewItem[])
-            : [];
-          
-          // Include this item if it matches or has matching children
-          if (matches || filteredChildren.length > 0) {
-            return {
-              ...item,
-              children: filteredChildren.length > 0 ? filteredChildren : item.children,
-            };
-          }
-          
-          // Exclude this item
-          return null;
-        })
-        .filter(Boolean) as EnhancedTreeViewItem[];
-    };
-    
-    setFilteredTreeData(filterTree(treeData));
-    
-    // Auto-expand filtered results
-    const newExpanded = new Set<string>();
-    const collectIds = (items: EnhancedTreeViewItem[]) => {
-      items.forEach(item => {
-        if (item.children && (item.children as EnhancedTreeViewItem[]).length > 0) {
-          newExpanded.add(item.id);
-          collectIds(item.children as EnhancedTreeViewItem[]);
-        }
-      });
-    };
-    
-    collectIds(filterTree(treeData));
-    if (newExpanded.size > 0) {
-      setExpandedItems(newExpanded);
-    }
-  }, [treeData, filterValue]);
-
-  // Sort entries
-  const sortEntries = (
-    entriesToSort: FileSystemEntry[],
-    order: "asc" | "desc",
-    by: "size" | "count"
-  ) => {
-    return [...entriesToSort].sort((a, b) => {
-      const valueA = by === "size" ? a.size_bytes : a.entry_count;
-      const valueB = by === "size" ? b.size_bytes : b.entry_count;
-      return order === "asc" ? valueA - valueB : valueB - valueA;
-    });
-  };
-
-  const toggleSortOrder = () => {
-    const newOrder = sortOrder === "asc" ? "desc" : "asc";
-    setSortOrder(newOrder);
-    setEntries(sortEntries(entries, newOrder, sortBy));
-  };
-
-  const changeSortBy = (by: "size" | "count") => {
-    setSortBy(by);
-    setEntries(sortEntries(entries, sortOrder, by));
-  };
-
   const selectDirectory = async () => {
     try {
       // Open directory dialog
@@ -433,9 +345,7 @@ export function DirectoryScanner() {
         setSelectedPath(selected);
         
         // Reset any previous scan data when selecting a new directory
-        setEntries([]);
         setTreeData([]);
-        setFilteredTreeData([]);
         setError(null);
       }
     } catch (err) {
@@ -475,10 +385,6 @@ export function DirectoryScanner() {
         // Set scan time
         setScanTimeMs(result.scan_time_ms);
         
-        // Process all entries at once
-        const sortedEntries = sortEntries(result.entries, sortOrder, sortBy);
-        setEntries(sortedEntries);
-        
         // Calculate total size and files
         if (result.tree) {
           setTotalSize(result.tree.size_bytes);
@@ -487,7 +393,6 @@ export function DirectoryScanner() {
           // Convert tree to our format
           const convertedTree = [convertTreeNodeToTreeViewItem(result.tree)];
           setTreeData(convertedTree);
-          setFilteredTreeData(convertedTree);
           
           // No smart expand - only expand the root by default
           const newExpandedSet = new Set<string>([result.tree.path]);
@@ -532,7 +437,7 @@ export function DirectoryScanner() {
         unlistenComplete.then((unlisten) => unlisten());
       }
     };
-  }, [selectedPath, sortOrder, sortBy]);
+  }, [selectedPath]);
 
   const startScan = async () => {
     if (!selectedPath) {
@@ -543,9 +448,7 @@ export function DirectoryScanner() {
     try {
       // Clear state first
       setError(null);
-      setEntries([]);
       setTreeData([]);
-      setFilteredTreeData([]);
       setScanTimeMs(0);
       setScanning(true);
 
@@ -664,25 +567,6 @@ export function DirectoryScanner() {
                       variant="ghost"
                       size="sm"
                       className="h-14 w-14 flex flex-col items-center gap-1"
-                      onClick={toggleSortOrder}
-                    >
-                      {sortOrder === "asc" ? (
-                        <SortAsc className="h-5 w-5" />
-                      ) : (
-                        <SortDesc className="h-5 w-5" />
-                      )}
-                      <span className="text-xs">Sort</span>
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Toggle sort order</TooltipContent>
-                </Tooltip>
-
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-14 w-14 flex flex-col items-center gap-1"
                     >
                       <Settings className="h-5 w-5" />
                       <span className="text-xs">Configure</span>
@@ -726,56 +610,15 @@ export function DirectoryScanner() {
 
       {/* Main content - Scrollable */}
       <div className="flex-grow flex flex-col overflow-hidden h-0">
-        {filteredTreeData.length > 0 ? (
-          <>
-            <div className="p-2 flex justify-between items-center border-b flex-shrink-0 bg-background z-10">
-              <Input
-                type="text"
-                placeholder="Filter files and folders..."
-                value={filterValue}
-                onChange={(e) => setFilterValue(e.target.value)}
-                className="w-64 text-sm"
-              />
-
-              <div className="flex gap-2 items-center">
-                <Button
-                  onClick={toggleSortOrder}
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs"
-                >
-                  {sortOrder === "asc" ? "↑" : "↓"}
-                </Button>
-
-                <Button
-                  onClick={() => changeSortBy("size")}
-                  variant={sortBy === "size" ? "secondary" : "ghost"}
-                  size="sm"
-                  className="text-xs"
-                >
-                  Size
-                </Button>
-
-                <Button
-                  onClick={() => changeSortBy("count")}
-                  variant={sortBy === "count" ? "secondary" : "ghost"}
-                  size="sm"
-                  className="text-xs"
-                >
-                  Count
-                </Button>
-              </div>
-            </div>
-
-            <div className="flex-grow overflow-auto h-0">
-              <TreeSizeView
-                data={filteredTreeData}
-                formatSize={formatSize}
-                expandedItems={expandedItems}
-                onToggleExpand={handleToggleExpand}
-              />
-            </div>
-          </>
+        {treeData.length > 0 ? (
+          <div className="flex-grow overflow-auto h-0">
+            <TreeSizeView
+              data={treeData}
+              formatSize={formatSize}
+              expandedItems={expandedItems}
+              onToggleExpand={handleToggleExpand}
+            />
+          </div>
         ) : (
           <div className="flex items-center justify-center h-full">
             <div className="text-muted p-8 text-center">
@@ -801,7 +644,7 @@ export function DirectoryScanner() {
               Scanning... Please wait
             </span>
           )}
-          {!scanning && filteredTreeData.length > 0 && (
+          {!scanning && treeData.length > 0 && (
             <span>
               {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
               {scanTimeMs > 0 && ` (scanned in ${(scanTimeMs / 1000).toFixed(2)}s)`}
