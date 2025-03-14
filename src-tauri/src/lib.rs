@@ -80,8 +80,6 @@ struct FileSystemTreeNode {
 struct DirectoryScanResult {
     /// The root directory path
     root_path: PathBuf,
-    /// All entries found during the scan (flat list)
-    entries: Vec<FileSystemEntry>,
     /// Tree representation of the directory structure
     tree: FileSystemTreeNode,
     /// Total scan time in milliseconds
@@ -452,6 +450,96 @@ fn build_tree_from_entries_with_depth(entries: &[FileSystemEntry], root_path: &P
     build_node(&root_entry.path, root_entry, &children_map, &path_map, 0, max_depth)
 }
 
+// This function builds a tree from prebuilt indices
+fn build_tree_from_indices(
+    entries: &[FileSystemEntry],
+    path_map: &HashMap<PathBuf, usize>,
+    children_map: &HashMap<PathBuf, Vec<usize>>,
+    target_path: &Path,
+    max_depth: usize
+) -> Option<FileSystemTreeNode> {
+    // Find the index of the target path
+    let target_index = match path_map.get(target_path) {
+        Some(&idx) => idx,
+        None => return None,
+    };
+    
+    // Get the entry for the target path
+    let target_entry = &entries[target_index];
+    
+    // Recursive function to build the tree starting from the target
+    fn build_node(
+        path: &Path,
+        entry: &FileSystemEntry,
+        entries: &[FileSystemEntry],
+        children_indices: Option<&Vec<usize>>,
+        current_depth: usize,
+        max_depth: usize
+    ) -> FileSystemTreeNode {
+        // Extract name from path
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        // Get children for this path if we haven't reached max depth
+        let mut children = Vec::new();
+        if current_depth < max_depth {
+            if let Some(indices) = children_indices {
+                for &child_idx in indices {
+                    let child_entry = &entries[child_idx];
+                    
+                    let child_node = FileSystemTreeNode {
+                        path: child_entry.path.clone(),
+                        name: child_entry.path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        size_bytes: child_entry.size_bytes,
+                        entry_count: child_entry.entry_count,
+                        file_count: child_entry.file_count,
+                        directory_count: child_entry.directory_count,
+                        percent_of_parent: if entry.size_bytes > 0 {
+                            (child_entry.size_bytes as f64 / entry.size_bytes as f64) * 100.0
+                        } else {
+                            0.0
+                        },
+                        children: Vec::new(), // No need to build children of children here
+                    };
+                    
+                    children.push(child_node);
+                }
+                
+                // No need to sort here - the indices are already sorted by size (largest first)
+            }
+        }
+        
+        FileSystemTreeNode {
+            path: entry.path.clone(),
+            name,
+            size_bytes: entry.size_bytes,
+            entry_count: entry.entry_count,
+            file_count: entry.file_count,
+            directory_count: entry.directory_count,
+            percent_of_parent: 100.0, // Default value, will be updated by parent
+            children,
+        }
+    }
+    
+    // Build the tree node
+    let children_indices = children_map.get(target_path);
+    let node = build_node(
+        target_path,
+        target_entry,
+        entries,
+        children_indices,
+        0,
+        max_depth
+    );
+    
+    Some(node)
+}
+
 // Define a global cache to store scan results
 lazy_static! {
     static ref GLOBAL_SCAN_CACHE: Mutex<Option<ScanCache>> = Mutex::new(None);
@@ -461,8 +549,9 @@ lazy_static! {
 struct ScanCache {
     root_path: PathBuf,
     entries: Vec<FileSystemEntry>,
-    analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
-    scan_time_ms: u64,
+    // Prebuilt indices for faster tree building
+    path_map: HashMap<PathBuf, usize>,         // Maps path to index in entries
+    children_map: HashMap<PathBuf, Vec<usize>>, // Maps parent path to indices of children in entries
 }
 
 // New command to scan directory and return complete results at once
@@ -526,38 +615,22 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     
     // Calculate scan time
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
-    
+
     // Convert the analytics map to a vector of entries
     let entries = analytics_map_to_entries(&analytics_map);
     
-    // Build the tree from the entries with limited depth (only root and direct children)
-    let max_depth = 1; // 0 = root only, 1 = root + direct children
-    let tree = build_tree_from_entries_with_depth(&entries, &target_dir, max_depth);
-    
-    // Store the results in the global cache
-    let cache = ScanCache {
-        root_path: target_dir.clone(),
-        entries: entries.clone(),
-        analytics_map: analytics_map.clone(),
-        scan_time_ms: elapsed_ms,
-    };
-    
-    // Update the global cache
-    if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
-        *global_cache = Some(cache);
-    } else {
-        eprintln!("Failed to acquire lock on global cache");
-    }
+    // Build the initial tree from the entries with just a basic approach
+    // This will be quick and allows us to show results to the user without waiting for indexing
+    let tree = build_tree_from_entries_with_depth(&entries, &target_dir, 1);
     
     // Create the complete result object
     let result = DirectoryScanResult {
-        root_path: target_dir,
-        entries, // Still include all entries for reference
-        tree,
+        root_path: target_dir.clone(),
+        tree: tree.clone(),
         scan_time_ms: elapsed_ms,
     };
     
-    // Send the complete result as a single event
+    // Send the complete result as a single event immediately
     if let Err(e) = window.emit("scan-result", &result) {
         eprintln!("Failed to emit scan result: {}", e);
     }
@@ -566,6 +639,59 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     if let Err(e) = window.emit("scan-complete", ()) {
         eprintln!("Failed to emit completion event: {}", e);
     }
+    
+    // Now that the user sees the results, build the indices in the background
+    // Clone what we need for the async task
+    let entries_clone = entries.clone();
+    let target_dir_clone = target_dir.clone();
+    
+    // Spawn a new async task to build the indices
+    tokio::spawn(async move {
+        // Prebuild indices for faster tree building
+        let mut path_map = HashMap::with_capacity(entries_clone.len());
+        let mut children_map = HashMap::new();
+        
+        // First pass: build path_map (map from path to index in entries)
+        for (i, entry) in entries_clone.iter().enumerate() {
+            path_map.insert(entry.path.clone(), i);
+        }
+        
+        // Second pass: build children_map (map from parent path to indices of children)
+        for (i, entry) in entries_clone.iter().enumerate() {
+            if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+                // Skip entries that are outside our target directory
+                if !parent_path.starts_with(&target_dir_clone) && parent_path != target_dir_clone {
+                    continue;
+                }
+                
+                children_map.entry(parent_path).or_insert_with(Vec::new).push(i);
+            }
+        }
+        
+        // Third pass: sort children by size (largest first) for each parent
+        for (_, indices) in children_map.iter_mut() {
+            indices.sort_by(|&a, &b| {
+                let size_a = entries_clone[a].size_bytes;
+                let size_b = entries_clone[b].size_bytes;
+                size_b.cmp(&size_a) // Sort largest first
+            });
+        }
+        
+        // Store the results in the global cache
+        let cache = ScanCache {
+            root_path: target_dir_clone,
+            entries: entries_clone,
+            path_map,
+            children_map,
+        };
+        
+        // Update the global cache
+        if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
+            *global_cache = Some(cache);
+        } else {
+            eprintln!("Failed to acquire lock on global cache");
+        }
+    });
     
     Ok(())
 }
@@ -590,11 +716,22 @@ async fn get_directory_children(path: String) -> Result<FileSystemTreeNode, Stri
                                target_dir.display(), cache.root_path.display()));
         }
         
-        // Find the entry for this path in our cached entries
+        // Use the prebuilt indices to build the tree (much faster)
+        if let Some(tree) = build_tree_from_indices(
+            &cache.entries,
+            &cache.path_map,
+            &cache.children_map,
+            &target_dir,
+            1 // Just show direct children
+        ) {
+            return Ok(tree);
+        }
+        
+        // If the optimized method failed (unlikely), fall back to the original method
         let entry = cache.entries.iter().find(|e| e.path == target_dir);
         
-        if let Some(found_entry) = entry {
-            // Build a tree for just this directory's children using our cached data
+        if let Some(_) = entry {
+            // Build a tree using the original method
             let tree = build_tree_from_entries_with_depth(&cache.entries, &target_dir, 1);
             return Ok(tree);
         } else {

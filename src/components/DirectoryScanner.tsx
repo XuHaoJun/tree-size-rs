@@ -41,17 +41,6 @@ interface EnhancedTreeViewItem extends BaseTreeViewItem {
   loaded?: boolean;  // Track if directory contents have been loaded
 }
 
-interface FileSystemEntry {
-  path: string;
-  size_bytes: number;
-  entry_count: number;
-  file_count: number;
-  directory_count: number;
-  allocated_bytes?: number;
-  last_modified?: string;
-  owner?: string;
-}
-
 interface FileSystemTreeNode {
   path: string;
   name: string;
@@ -65,7 +54,6 @@ interface FileSystemTreeNode {
 
 interface DirectoryScanResult {
   root_path: string; 
-  entries: FileSystemEntry[];
   tree: FileSystemTreeNode;
   scan_time_ms: number;
 }
