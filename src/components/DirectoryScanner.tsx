@@ -40,6 +40,8 @@ interface EnhancedTreeViewItem extends BaseTreeViewItem {
   owner: string;
   depth: number;
   backgroundColor?: string;
+  loading?: boolean; // Add loading state for lazy-loaded directories
+  loaded?: boolean;  // Track if directory contents have been loaded
 }
 
 interface FileSystemEntry {
@@ -131,6 +133,181 @@ export function DirectoryScanner() {
     // No specific resize handling needed for the new layout
   };
 
+  // Handle expanding a directory - fetch children if needed
+  const handleToggleExpand = async (itemId: string) => {
+    // Find the item in the tree
+    const findItem = (items: EnhancedTreeViewItem[]): EnhancedTreeViewItem | null => {
+      for (const item of items) {
+        if (item.id === itemId) {
+          return item;
+        }
+        const children = item.children as EnhancedTreeViewItem[] | undefined;
+        if (children && children.length > 0) {
+          const found = findItem(children);
+          if (found) {
+            return found;
+          }
+        }
+      }
+      return null;
+    };
+
+    // Toggle the expanded state
+    setExpandedItems((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(itemId)) {
+        newSet.delete(itemId);
+        return newSet;
+      } else {
+        newSet.add(itemId);
+        
+        // Check if we need to load children
+        const item = findItem(treeData);
+        if (item && item.type === "directory" && (!item.loaded || (item.children && item.children.length === 0))) {
+          // Set loading state for this directory
+          const updateLoadingState = (
+            items: EnhancedTreeViewItem[],
+            dirId: string,
+            isLoading: boolean
+          ): EnhancedTreeViewItem[] => {
+            return items.map((item) => {
+              if (item.id === dirId) {
+                return {
+                  ...item,
+                  loading: isLoading,
+                };
+              } else if (item.children) {
+                return {
+                  ...item,
+                  children: updateLoadingState(
+                    item.children as EnhancedTreeViewItem[],
+                    dirId,
+                    isLoading
+                  ),
+                };
+              }
+              return item;
+            });
+          };
+          
+          // Update loading state in the tree
+          setTreeData((prevData) => updateLoadingState(prevData, itemId, true));
+          setFilteredTreeData((prevData) => updateLoadingState(prevData, itemId, true));
+          
+          // Load children asynchronously
+          loadDirectoryChildren(itemId).catch((err) => {
+            console.error("Error loading directory children:", err);
+            setError(`Failed to load directory contents: ${err}`);
+            
+            // Update loading state in the tree (set to false)
+            setTreeData((prevData) => updateLoadingState(prevData, itemId, false));
+            setFilteredTreeData((prevData) => updateLoadingState(prevData, itemId, false));
+          });
+        }
+        
+        return newSet;
+      }
+    });
+  };
+
+  // Function to load directory children from Tauri
+  const loadDirectoryChildren = async (directoryId: string) => {
+    try {
+      // Find the directory in the tree to update it
+      const updateTreeWithChildren = (
+        items: EnhancedTreeViewItem[],
+        dirId: string,
+        newChildren: EnhancedTreeViewItem[]
+      ): EnhancedTreeViewItem[] => {
+        return items.map((item) => {
+          if (item.id === dirId) {
+            return {
+              ...item,
+              children: newChildren,
+              loaded: true,
+              loading: false,
+            };
+          } else if (item.children) {
+            const children = item.children as EnhancedTreeViewItem[];
+            return {
+              ...item,
+              children: updateTreeWithChildren(
+                children,
+                dirId,
+                newChildren
+              ),
+            };
+          }
+          return item;
+        });
+      };
+
+      // Call Tauri to get directory children
+      const result = await invoke<FileSystemTreeNode>("get_directory_children", {
+        path: directoryId,
+      });
+
+      // Convert children to our tree format
+      const children = result.children.map((child) =>
+        convertTreeNodeToTreeViewItem(child, 1) // Set depth to 1
+      );
+
+      // Update tree data with new children
+      setTreeData((prevData) => updateTreeWithChildren(prevData, directoryId, children));
+      setFilteredTreeData((prevData) => updateTreeWithChildren(prevData, directoryId, children));
+
+    } catch (err) {
+      console.error("Error loading directory children:", err);
+      
+      // Check if the error is related to missing cache
+      if (String(err).includes("No scan data available")) {
+        // If scan data is missing but we have a selected path, try to rescan
+        if (selectedPath) {
+          setError("Cache data unavailable. Rescanning directory...");
+          
+          // Reset loading state for the directory that failed
+          const updateLoadingState = (
+            items: EnhancedTreeViewItem[],
+            dirId: string,
+            isLoading: boolean
+          ): EnhancedTreeViewItem[] => {
+            return items.map((item) => {
+              if (item.id === dirId) {
+                return {
+                  ...item,
+                  loading: isLoading,
+                };
+              } else if (item.children) {
+                return {
+                  ...item,
+                  children: updateLoadingState(
+                    item.children as EnhancedTreeViewItem[],
+                    dirId,
+                    isLoading
+                  ),
+                };
+              }
+              return item;
+            });
+          };
+          
+          // Update loading state in the tree (set to false)
+          setTreeData((prevData) => updateLoadingState(prevData, directoryId, false));
+          setFilteredTreeData((prevData) => updateLoadingState(prevData, directoryId, false));
+          
+          // Attempt to rescan
+          try {
+            await startScan();
+          } catch (scanErr) {
+            setError(`Failed to rescan: ${scanErr}`);
+          }
+        }
+      }
+      
+      throw err;
+    }
+  };
+
   // Convert the Rust tree to our enhanced tree view format
   const convertTreeNodeToTreeViewItem = (
     node: FileSystemTreeNode,
@@ -153,6 +330,7 @@ export function DirectoryScanner() {
       children: node.children.map(child => 
         convertTreeNodeToTreeViewItem(child, depth + 1)
       ),
+      loaded: node.children.length > 0, // Track if children are already loaded
     };
   };
 
@@ -242,6 +420,16 @@ export function DirectoryScanner() {
       });
 
       if (selected && !Array.isArray(selected)) {
+        // If we're changing directories, clear the cache first
+        if (selectedPath && selectedPath !== selected) {
+          try {
+            await invoke("clear_scan_cache");
+          } catch (err) {
+            console.error("Failed to clear scan cache:", err);
+            // Continue anyway
+          }
+        }
+        
         setSelectedPath(selected);
         
         // Reset any previous scan data when selecting a new directory
@@ -301,8 +489,8 @@ export function DirectoryScanner() {
           setTreeData(convertedTree);
           setFilteredTreeData(convertedTree);
           
-          // Smart expand the root tree
-          const newExpandedSet = smartExpandTree(convertedTree, new Set(), 10);
+          // No smart expand - only expand the root by default
+          const newExpandedSet = new Set<string>([result.tree.path]);
           setExpandedItems(newExpandedSet);
         }
         
@@ -373,96 +561,15 @@ export function DirectoryScanner() {
     }
   };
 
-  // Smart expand the tree to show at least N items
-  const smartExpandTree = (
-    items: EnhancedTreeViewItem[],
-    expandedSet: Set<string>,
-    minItems = 10
-  ): Set<string> => {
-    let visibleCount = items.length;
-    const newExpandedSet = new Set(expandedSet);
-
-    // If we already have enough items visible, no need to expand further
-    if (visibleCount >= minItems) {
-      return newExpandedSet;
-    }
-
-    // Sort items by size to expand the largest directories first
-    const sortedItems = [...items].sort((a, b) => b.sizeBytes - a.sizeBytes);
-
-    // First pass: expand largest directories until we have enough visible items
-    for (const item of sortedItems) {
-      if (visibleCount >= minItems) break;
-
-      if (item.children && item.children.length > 0) {
-        newExpandedSet.add(item.id);
-        visibleCount += item.children.length;
-      }
-    }
-
-    // Second pass: if we still don't have enough items, recursively expand subdirectories
-    if (visibleCount < minItems) {
-      for (const item of sortedItems) {
-        if (
-          newExpandedSet.has(item.id) &&
-          item.children &&
-          item.children.length > 0
-        ) {
-          // Only recurse into directories we've already expanded
-          const childItems = item.children as EnhancedTreeViewItem[];
-          const updatedSet = smartExpandTree(
-            childItems,
-            newExpandedSet,
-            minItems
-          );
-
-          // Update our expanded set with any new expansions
-          for (const id of updatedSet) {
-            newExpandedSet.add(id);
-          }
-
-          // Recalculate visible count
-          visibleCount = countVisibleItems(items, newExpandedSet);
-
-          if (visibleCount >= minItems) break;
-        }
-      }
-    }
-
-    return newExpandedSet;
-  };
-
-  // Count visible items in the tree
-  const countVisibleItems = (
-    items: EnhancedTreeViewItem[],
-    expandedSet: Set<string>
-  ): number => {
-    let count = items.length;
-
-    for (const item of items) {
-      if (expandedSet.has(item.id) && item.children) {
-        count += countVisibleItems(
-          item.children as EnhancedTreeViewItem[],
-          expandedSet
-        );
-      }
-    }
-
-    return count;
-  };
-
-  // Handle toggle expand
-  const handleToggleExpand = (itemId: string) => {
-    setExpandedItems((prev) => {
-      const newSet = new Set(prev);
-      if (newSet.has(itemId)) {
-        newSet.delete(itemId);
-      } else {
-        newSet.add(itemId);
-      }
-      return newSet;
-    });
-  };
+  // Add a cleanup effect to clear the cache when component unmounts
+  useEffect(() => {
+    return () => {
+      // Attempt to clear the cache when the component unmounts
+      invoke("clear_scan_cache").catch(err => {
+        console.error("Failed to clear scan cache on unmount:", err);
+      });
+    };
+  }, []);
 
   return (
     <div className="h-full w-full flex flex-col overflow-hidden" style={{ height: '100vh', maxHeight: '100vh' }}>
@@ -764,13 +871,14 @@ function TreeSizeItem({
   expandedItems: Set<string>;
 }) {
   const toggleExpand = () => {
-    if (item.children && item.children.length > 0) {
+    // Check if the item is a directory or has children
+    if (item.type === "directory") {
       onToggleExpand(item.id);
     }
   };
 
-  const hasChildren = item.children && item.children.length > 0;
   const isSignificantSize = item.percentOfParent >= 20;
+  const isLoading = item.loading || false;
 
   return (
     <div>
@@ -780,8 +888,10 @@ function TreeSizeItem({
           className="p-1 flex items-center justify-center cursor-pointer"
           onClick={toggleExpand}
         >
-          {hasChildren &&
-            (expanded ? (
+          {item.type === "directory" &&
+            (isLoading ? (
+              <span className="animate-spin h-4 w-4">⟳</span>
+            ) : expanded ? (
               <ChevronDown className="h-4 w-4" />
             ) : (
               <ChevronRight className="h-4 w-4" />
