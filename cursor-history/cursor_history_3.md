@@ -66,6 +66,35 @@ In this session, we optimized a Rust directory size analyzer by learning from "d
 - Improved child entry detection to distinguish between real files and symlinks
 - Made code more resilient to various filesystem configurations with symlinks
 
+### 11. Algorithm Evolution: Old vs. New Implementation
+
+#### Original Algorithm
+- **Early symlink handling**: Special case for symlinks at the beginning of the function
+- **Immediate updates**: Updated parent directories immediately after processing each file
+- **Channel-based streaming**: Sent events during processing via a channel for each processed file
+- **Simpler data structures**: Fewer tracking mechanisms but less robust
+- **Update batching**: Collected updates in a vector and processed them in batches
+- **No processed path tracking**: Relied solely on inode tracking for cycle detection
+- **Sequential recursive calls**: Simple but potentially less efficient for deeply nested structures
+
+#### Optimized Algorithm
+- **Unified path handling**: Treats all path types (files, directories, symlinks) within the same core logic
+- **Deferred updates**: Processes all children first, then updates parent directories
+- **Collective event system**: Gathers all data and sends a single comprehensive event
+- **Dual-layer cycle prevention**: Uses both inode tracking and processed path tracking
+- **Smart child processing**: Special handling for different types of child entries (files, symlinks, directories)
+- **Accurate counting**: Precise tracking of file, directory, and entry counts with atomics
+- **Tree construction**: Builds a hierarchical structure directly in Rust rather than in JavaScript
+
+#### Trade-offs
+- **Memory vs. Speed**: New implementation uses more memory for tracking but delivers more consistent results
+- **Simplicity vs. Robustness**: Original code was simpler but had edge case issues; new code handles edge cases better
+- **Real-time Updates vs. Consistency**: Old version provided live updates but with fluctuating values; new version provides stable, complete results
+- **Processing Overhead**: New algorithm has more sophisticated logic but eliminates rework and redundant calculations
+- **Extensibility**: New approach is more modular and easier to extend with additional functionality
+- **Error Handling**: Enhanced error detection and recovery in the optimized version
+- **Platform Compatibility**: Better cross-platform behavior with unified path handling logic
+
 ## Testing
 - Resolved failing test case `test_calculate_size_with_symlink`
 - Ensured proper counting of files, directories, and symlinks
