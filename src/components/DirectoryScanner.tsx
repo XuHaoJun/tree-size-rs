@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { bytesToReadableSize, normalizePath, getParentPath } from "@/lib/utils";
+import { bytesToReadableSize, normalizePath } from "@/lib/utils";
 import { TreeViewItem as BaseTreeViewItem } from "@/components/tree-view";
 import {
   Folder,
@@ -53,12 +53,27 @@ interface FileSystemEntry {
   owner?: string;
 }
 
+interface FileSystemTreeNode {
+  path: string;
+  name: string;
+  size_bytes: number;
+  entry_count: number;
+  file_count: number;
+  directory_count: number;
+  percent_of_parent: number;
+  children: FileSystemTreeNode[];
+}
+
+interface DirectoryScanResult {
+  root_path: string; 
+  entries: FileSystemEntry[];
+  tree: FileSystemTreeNode;
+  scan_time_ms: number;
+}
+
 export function DirectoryScanner() {
   const [selectedPath, setSelectedPath] = useState<string>("");
   const [entries, setEntries] = useState<FileSystemEntry[]>([]);
-  const [displayedEntries, setDisplayedEntries] = useState<FileSystemEntry[]>(
-    []
-  );
   const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([]);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
@@ -72,6 +87,8 @@ export function DirectoryScanner() {
   const [totalSize, setTotalSize] = useState<number>(0);
   const [totalFiles, setTotalFiles] = useState<number>(0);
   const [freeSpace, setFreeSpace] = useState<string>("N/A");
+  const [scanTimeMs, setScanTimeMs] = useState<number>(0);
+  const [filteredTreeData, setFilteredTreeData] = useState<EnhancedTreeViewItem[]>([]);
 
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
@@ -114,21 +131,82 @@ export function DirectoryScanner() {
     // No specific resize handling needed for the new layout
   };
 
-  // Handle filtering and sorting when entries change
-  useEffect(() => {
-    let filtered = entries;
+  // Convert the Rust tree to our enhanced tree view format
+  const convertTreeNodeToTreeViewItem = (
+    node: FileSystemTreeNode,
+    depth: number = 0
+  ): EnhancedTreeViewItem => {
+    return {
+      id: node.path,
+      name: node.name,
+      type: node.directory_count > 0 ? "directory" : "file",
+      sizeBytes: node.size_bytes,
+      entryCount: node.entry_count,
+      allocatedBytes: node.size_bytes, // Use size_bytes as allocatedBytes
+      fileCount: node.file_count,
+      folderCount: node.directory_count,
+      percentOfParent: node.percent_of_parent,
+      lastModified: new Date().toLocaleDateString(), // Default date
+      owner: "Unknown",
+      depth,
+      backgroundColor: getColorForPercentage(),
+      children: node.children.map(child => 
+        convertTreeNodeToTreeViewItem(child, depth + 1)
+      ),
+    };
+  };
 
-    if (filterValue) {
-      filtered = entries.filter((entry) =>
-        normalizePath(entry.path).toLowerCase().includes(filterValue.toLowerCase())
-      );
+  // Filter the tree data based on the filter value
+  useEffect(() => {
+    if (!treeData.length || !filterValue.trim()) {
+      setFilteredTreeData(treeData);
+      return;
     }
 
-    setDisplayedEntries(filtered);
-
-    // Build tree structure
-    buildTreeData(filtered);
-  }, [entries, filterValue]);
+    const filterTree = (items: EnhancedTreeViewItem[]): EnhancedTreeViewItem[] => {
+      return items
+        .map(item => {
+          // Check if this item matches the filter
+          const matches = item.name.toLowerCase().includes(filterValue.toLowerCase()) ||
+                         item.id.toLowerCase().includes(filterValue.toLowerCase());
+          
+          // If it has children, filter them too
+          const filteredChildren = item.children 
+            ? filterTree(item.children as EnhancedTreeViewItem[])
+            : [];
+          
+          // Include this item if it matches or has matching children
+          if (matches || filteredChildren.length > 0) {
+            return {
+              ...item,
+              children: filteredChildren.length > 0 ? filteredChildren : item.children,
+            };
+          }
+          
+          // Exclude this item
+          return null;
+        })
+        .filter(Boolean) as EnhancedTreeViewItem[];
+    };
+    
+    setFilteredTreeData(filterTree(treeData));
+    
+    // Auto-expand filtered results
+    const newExpanded = new Set<string>();
+    const collectIds = (items: EnhancedTreeViewItem[]) => {
+      items.forEach(item => {
+        if (item.children && (item.children as EnhancedTreeViewItem[]).length > 0) {
+          newExpanded.add(item.id);
+          collectIds(item.children as EnhancedTreeViewItem[]);
+        }
+      });
+    };
+    
+    collectIds(filterTree(treeData));
+    if (newExpanded.size > 0) {
+      setExpandedItems(newExpanded);
+    }
+  }, [treeData, filterValue]);
 
   // Sort entries
   const sortEntries = (
@@ -168,8 +246,8 @@ export function DirectoryScanner() {
         
         // Reset any previous scan data when selecting a new directory
         setEntries([]);
-        setDisplayedEntries([]);
         setTreeData([]);
+        setFilteredTreeData([]);
         setError(null);
       }
     } catch (err) {
@@ -178,67 +256,16 @@ export function DirectoryScanner() {
     }
   };
 
-  // Set up event listeners for scan progress events
+  // Set up event listener for scan result event
   useEffect(() => {
-    let unlistenEntry: Promise<UnlistenFn>;
+    let unlistenResult: Promise<UnlistenFn>;
     let unlistenComplete: Promise<UnlistenFn>;
-    let bufferInterval: number | null = null;
 
     const setupListeners = async () => {
-      // Create a buffer to collect entries before updating state
-      let entriesBuffer: FileSystemEntry[] = [];
-
-      const processBuffer = () => {
-        if (entriesBuffer.length === 0) return;
-
-        setEntries((prevEntries) => {
-          // Create a map of the latest entries by path
-          const entryMap = new Map<string, FileSystemEntry>();
-
-          // First add all buffered entries to the map (duplicates will be overwritten)
-          entriesBuffer.forEach((entry) => {
-            entryMap.set(entry.path, entry);
-          });
-
-          // Create the updated entries array
-          const updatedEntries = [...prevEntries];
-
-          // Update or add entries from the buffer
-          entryMap.forEach((newEntry) => {
-            const existingEntryIndex = updatedEntries.findIndex(
-              (entry) => entry.path === newEntry.path
-            );
-
-            if (existingEntryIndex >= 0) {
-              // Update existing entry
-              updatedEntries[existingEntryIndex] = newEntry;
-            } else {
-              // Add new entry
-              updatedEntries.push(newEntry);
-            }
-          });
-
-          // Sort entries
-          const sortedEntries = sortEntries(updatedEntries, sortOrder, sortBy);
-
-          // Clear the buffer
-          entriesBuffer = [];
-
-          return sortedEntries;
-        });
-      };
-
-      const setupBufferProcessing = () => {
-        if (bufferInterval === null) {
-          bufferInterval = window.setInterval(processBuffer, 1000);
-        }
-      };
-
-      // Clean up any existing listeners first (important for Windows)
+      // Clean up any existing listeners first
       try {
         const cleanupListeners = async () => {
           try {
-            // Try to clean up any previous listeners that might still be active
             const dummyFn = await listen("dummy-event", () => {});
             dummyFn();
           } catch {
@@ -251,65 +278,42 @@ export function DirectoryScanner() {
         // Ignore cleanup errors
       }
 
-      unlistenEntry = listen<FileSystemEntry>("directory-entry", (event) => {
-        const newEntry = event.payload as FileSystemEntry;
-
-        setEntries((prevEntries) => {
-          // If we have fewer than 100 entries, update immediately
-          if (prevEntries.length < 10) {
-            const existingEntryIndex = prevEntries.findIndex(
-              (entry) => entry.path === newEntry.path
-            );
-
-            const updatedEntries =
-              existingEntryIndex >= 0
-                ? [...prevEntries]
-                : [...prevEntries, newEntry];
-
-            // If we found an existing entry, update it
-            if (existingEntryIndex >= 0) {
-              updatedEntries[existingEntryIndex] = newEntry;
-            }
-
-            // Sort entries
-            const sortedEntries = sortEntries(
-              updatedEntries,
-              sortOrder,
-              sortBy
-            );
-
-            // Clear the buffer
-            entriesBuffer = [];
-
-            return sortedEntries;
-          }
-
-          // If we have 100+ entries, use the buffer approach
-          entriesBuffer.push(newEntry);
-          setupBufferProcessing();
-
-          // If buffer reaches 10000 items, process it immediately
-          if (entriesBuffer.length >= 10000) {
-            processBuffer();
-          }
-
-          // Return unchanged state (buffer will update state later)
-          return prevEntries;
-        });
+      // Listen for the complete scan result
+      unlistenResult = listen<DirectoryScanResult>("scan-result", (event) => {
+        const result = event.payload as DirectoryScanResult;
+        
+        console.log("Received scan result:", result);
+        
+        // Set scan time
+        setScanTimeMs(result.scan_time_ms);
+        
+        // Process all entries at once
+        const sortedEntries = sortEntries(result.entries, sortOrder, sortBy);
+        setEntries(sortedEntries);
+        
+        // Calculate total size and files
+        if (result.tree) {
+          setTotalSize(result.tree.size_bytes);
+          setTotalFiles(result.tree.file_count);
+          
+          // Convert tree to our format
+          const convertedTree = [convertTreeNodeToTreeViewItem(result.tree)];
+          setTreeData(convertedTree);
+          setFilteredTreeData(convertedTree);
+          
+          // Smart expand the root tree
+          const newExpandedSet = smartExpandTree(convertedTree, new Set(), 10);
+          setExpandedItems(newExpandedSet);
+        }
+        
+        // Set scanning to false
+        setScanning(false);
       });
 
+      // Also listen for scan-complete for backward compatibility
       unlistenComplete = listen("scan-complete", () => {
-        // Process any remaining entries in the buffer
-        processBuffer();
-
-        // Clear the interval if it exists
-        if (bufferInterval !== null) {
-          clearInterval(bufferInterval);
-          bufferInterval = null;
-        }
-
         setScanning(false);
-
+        
         // Check free space
         if (selectedPath) {
           try {
@@ -333,16 +337,11 @@ export function DirectoryScanner() {
 
     return () => {
       // Clean up listeners when component unmounts
-      if (unlistenEntry) {
-        unlistenEntry.then((unlisten) => unlisten());
+      if (unlistenResult) {
+        unlistenResult.then((unlisten) => unlisten());
       }
       if (unlistenComplete) {
         unlistenComplete.then((unlisten) => unlisten());
-      }
-      // Clear the interval if it exists
-      if (bufferInterval !== null) {
-        clearInterval(bufferInterval);
-        bufferInterval = null;
       }
     };
   }, [selectedPath, sortOrder, sortBy]);
@@ -357,11 +356,12 @@ export function DirectoryScanner() {
       // Clear state first
       setError(null);
       setEntries([]);
-      setDisplayedEntries([]);
+      setTreeData([]);
+      setFilteredTreeData([]);
+      setScanTimeMs(0);
       setScanning(true);
 
       // Force a small delay to ensure any pending operations complete
-      // This helps prevent issues on Windows
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // Invoke the Rust command to scan the directory
@@ -462,119 +462,6 @@ export function DirectoryScanner() {
       }
       return newSet;
     });
-  };
-
-  // Build tree data from flat entries
-  const buildTreeData = (entriesData: FileSystemEntry[]) => {
-    if (entriesData.length === 0) {
-      setTreeData([]);
-      setTotalSize(0);
-      setTotalFiles(0);
-      return;
-    }
-
-    // Calculate total size and files
-    const totalBytes = entriesData.reduce(
-      (sum, entry) => sum + entry.size_bytes,
-      0
-    );
-    const totalFileCount = entriesData.reduce(
-      (sum, entry) => sum + entry.file_count,
-      0
-    );
-    setTotalSize(totalBytes);
-    setTotalFiles(totalFileCount);
-
-    // Create a map to store nodes by path
-    const pathMap = new Map<string, EnhancedTreeViewItem>();
-    const rootItems: EnhancedTreeViewItem[] = [];
-
-    // First pass: create all nodes and add them to the map
-    entriesData.forEach((entry) => {
-      // Normalize path for display
-      const normalizedPath = normalizePath(entry.path);
-      // Get just the filename or folder name
-      const name = normalizePath(entry.path, true);
-      const isDirectory = entry.directory_count > 0;
-      const depth = normalizedPath.split('/').length - 1;
-
-      // Calculate percentage of parent (will adjust later)
-      const percentOfParent = 100;
-
-      const item: EnhancedTreeViewItem = {
-        id: entry.path, // Keep original path as ID
-        name,
-        type: isDirectory ? "directory" : "file",
-        children: isDirectory ? [] : undefined,
-        sizeBytes: entry.size_bytes,
-        entryCount: entry.entry_count,
-        allocatedBytes: entry.allocated_bytes || entry.size_bytes,
-        fileCount: entry.file_count,
-        folderCount: entry.directory_count,
-        percentOfParent,
-        lastModified: entry.last_modified || new Date().toLocaleDateString(),
-        owner: entry.owner || "Unknown",
-        depth,
-        backgroundColor: getColorForPercentage(),
-      };
-
-      pathMap.set(entry.path, item);
-    });
-
-    // Second pass: build the tree structure and calculate percentages
-    entriesData.forEach((entry) => {
-      const item = pathMap.get(entry.path);
-      if (!item) return;
-
-      // Find the parent directory path
-      const parentPath = getParentPath(entry.path);
-      if (!parentPath) {
-        // This is a root item
-        rootItems.push(item);
-        return;
-      }
-
-      const parent = pathMap.get(parentPath);
-
-      if (parent && parent.children) {
-        // Add to parent's children
-        parent.children.push(item);
-
-        // Update parent's file and folder counts
-        if (item.type === "directory") {
-          parent.folderCount += item.folderCount;
-        } else {
-          parent.fileCount += 1;
-        }
-
-        // Calculate percentage of parent
-        item.percentOfParent =
-          parent.sizeBytes > 0 ? (item.sizeBytes / parent.sizeBytes) * 100 : 0;
-
-        // Update background color based on percentage
-        item.backgroundColor = getColorForPercentage();
-      } else {
-        // No parent found, add to root
-        rootItems.push(item);
-      }
-    });
-
-    // Sort children by size
-    const sortTreeItems = (items: EnhancedTreeViewItem[]) => {
-      items.sort((a, b) => b.sizeBytes - a.sizeBytes);
-      items.forEach((item) => {
-        if (item.children && item.children.length > 0) {
-          sortTreeItems(item.children as EnhancedTreeViewItem[]);
-        }
-      });
-    };
-
-    sortTreeItems(rootItems);
-
-    setTreeData(rootItems);
-
-    // Smart expand the tree to show at least 10 items
-    setExpandedItems((prev) => smartExpandTree(rootItems, prev, 10));
   };
 
   return (
@@ -732,7 +619,7 @@ export function DirectoryScanner() {
 
       {/* Main content - Scrollable */}
       <div className="flex-grow flex flex-col overflow-hidden h-0">
-        {treeData.length > 0 ? (
+        {filteredTreeData.length > 0 ? (
           <>
             <div className="p-2 flex justify-between items-center border-b flex-shrink-0 bg-background z-10">
               <Input
@@ -775,7 +662,7 @@ export function DirectoryScanner() {
 
             <div className="flex-grow overflow-auto h-0">
               <TreeSizeView
-                data={treeData}
+                data={filteredTreeData}
                 formatSize={formatSize}
                 expandedItems={expandedItems}
                 onToggleExpand={handleToggleExpand}
@@ -804,12 +691,13 @@ export function DirectoryScanner() {
         <div>
           {scanning && (
             <span className="text-muted-foreground animate-pulse">
-              Scanning... {displayedEntries.length} entries found
+              Scanning... Please wait
             </span>
           )}
-          {!scanning && treeData.length > 0 && (
+          {!scanning && filteredTreeData.length > 0 && (
             <span>
               {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
+              {scanTimeMs > 0 && ` (scanned in ${(scanTimeMs / 1000).toFixed(2)}s)`}
             </span>
           )}
         </div>

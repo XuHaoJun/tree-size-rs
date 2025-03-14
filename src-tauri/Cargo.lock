@@ -4619,8 +4619,11 @@ name = "tree-size-rs"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "dirs 5.0.1",
  "filesize",
  "kanal",
+ "log",
+ "rayon",
  "serde",
  "serde_json",
  "sysinfo",
