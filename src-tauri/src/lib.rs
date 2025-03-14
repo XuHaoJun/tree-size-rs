@@ -9,6 +9,7 @@ use tauri::Emitter;
 use std::collections::HashMap;
 use rayon::prelude::*;
 use std::sync::Mutex;
+use lazy_static::lazy_static;
 
 /// Contains analytics information for a directory or file
 #[derive(Debug)]
@@ -79,8 +80,6 @@ struct FileSystemTreeNode {
 struct DirectoryScanResult {
     /// The root directory path
     root_path: PathBuf,
-    /// All entries found during the scan (flat list)
-    entries: Vec<FileSystemEntry>,
     /// Tree representation of the directory structure
     tree: FileSystemTreeNode,
     /// Total scan time in milliseconds
@@ -357,8 +356,8 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         .collect()
 }
 
-// This function builds a tree from the flat list of entries
-fn build_tree_from_entries(entries: &[FileSystemEntry], root_path: &Path) -> FileSystemTreeNode {
+// This function builds a tree from the flat list of entries with a limited depth
+fn build_tree_from_entries_with_depth(entries: &[FileSystemEntry], root_path: &Path, max_depth: usize) -> FileSystemTreeNode {
     // Create a map of path -> entry for quick lookups
     let path_map: HashMap<PathBuf, &FileSystemEntry> = entries
         .iter()
@@ -387,12 +386,14 @@ fn build_tree_from_entries(entries: &[FileSystemEntry], root_path: &Path) -> Fil
         panic!("No entries found to build tree");
     }));
     
-    // Recursive function to build the tree
+    // Recursive function to build the tree with depth limit
     fn build_node(
         path: &Path, 
         entry: &FileSystemEntry,
         children_map: &HashMap<PathBuf, Vec<PathBuf>>,
-        path_map: &HashMap<PathBuf, &FileSystemEntry>
+        path_map: &HashMap<PathBuf, &FileSystemEntry>,
+        current_depth: usize,
+        max_depth: usize
     ) -> FileSystemTreeNode {
         // Extract name from path
         let name = path.file_name()
@@ -400,18 +401,27 @@ fn build_tree_from_entries(entries: &[FileSystemEntry], root_path: &Path) -> Fil
             .unwrap_or("unknown")
             .to_string();
         
-        // Get children for this path
+        // Get children for this path if we haven't reached max depth
         let mut children = Vec::new();
-        if let Some(child_paths) = children_map.get(&entry.path) {
-            for child_path in child_paths {
-                if let Some(child_entry) = path_map.get(child_path) {
-                    let child_node = build_node(child_path, child_entry, children_map, path_map);
-                    children.push(child_node);
+        if current_depth < max_depth {
+            if let Some(child_paths) = children_map.get(&entry.path) {
+                for child_path in child_paths {
+                    if let Some(child_entry) = path_map.get(child_path) {
+                        let child_node = build_node(
+                            child_path, 
+                            child_entry, 
+                            children_map, 
+                            path_map,
+                            current_depth + 1,
+                            max_depth
+                        );
+                        children.push(child_node);
+                    }
                 }
+                
+                // Sort children by size (largest first)
+                children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
             }
-            
-            // Sort children by size (largest first)
-            children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
         }
         
         // Calculate percentages for children
@@ -436,8 +446,112 @@ fn build_tree_from_entries(entries: &[FileSystemEntry], root_path: &Path) -> Fil
         }
     }
     
-    // Build the tree starting from the root
-    build_node(&root_entry.path, root_entry, &children_map, &path_map)
+    // Build the tree starting from the root with depth limit
+    build_node(&root_entry.path, root_entry, &children_map, &path_map, 0, max_depth)
+}
+
+// This function builds a tree from prebuilt indices
+fn build_tree_from_indices(
+    entries: &[FileSystemEntry],
+    path_map: &HashMap<PathBuf, usize>,
+    children_map: &HashMap<PathBuf, Vec<usize>>,
+    target_path: &Path,
+    max_depth: usize
+) -> Option<FileSystemTreeNode> {
+    // Find the index of the target path
+    let target_index = match path_map.get(target_path) {
+        Some(&idx) => idx,
+        None => return None,
+    };
+    
+    // Get the entry for the target path
+    let target_entry = &entries[target_index];
+    
+    // Recursive function to build the tree starting from the target
+    fn build_node(
+        path: &Path,
+        entry: &FileSystemEntry,
+        entries: &[FileSystemEntry],
+        children_indices: Option<&Vec<usize>>,
+        current_depth: usize,
+        max_depth: usize
+    ) -> FileSystemTreeNode {
+        // Extract name from path
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        // Get children for this path if we haven't reached max depth
+        let mut children = Vec::new();
+        if current_depth < max_depth {
+            if let Some(indices) = children_indices {
+                for &child_idx in indices {
+                    let child_entry = &entries[child_idx];
+                    
+                    let child_node = FileSystemTreeNode {
+                        path: child_entry.path.clone(),
+                        name: child_entry.path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        size_bytes: child_entry.size_bytes,
+                        entry_count: child_entry.entry_count,
+                        file_count: child_entry.file_count,
+                        directory_count: child_entry.directory_count,
+                        percent_of_parent: if entry.size_bytes > 0 {
+                            (child_entry.size_bytes as f64 / entry.size_bytes as f64) * 100.0
+                        } else {
+                            0.0
+                        },
+                        children: Vec::new(), // No need to build children of children here
+                    };
+                    
+                    children.push(child_node);
+                }
+                
+                // No need to sort here - the indices are already sorted by size (largest first)
+            }
+        }
+        
+        FileSystemTreeNode {
+            path: entry.path.clone(),
+            name,
+            size_bytes: entry.size_bytes,
+            entry_count: entry.entry_count,
+            file_count: entry.file_count,
+            directory_count: entry.directory_count,
+            percent_of_parent: 100.0, // Default value, will be updated by parent
+            children,
+        }
+    }
+    
+    // Build the tree node
+    let children_indices = children_map.get(target_path);
+    let node = build_node(
+        target_path,
+        target_entry,
+        entries,
+        children_indices,
+        0,
+        max_depth
+    );
+    
+    Some(node)
+}
+
+// Define a global cache to store scan results
+lazy_static! {
+    static ref GLOBAL_SCAN_CACHE: Mutex<Option<ScanCache>> = Mutex::new(None);
+}
+
+// Structure to hold cached scan data
+struct ScanCache {
+    root_path: PathBuf,
+    entries: Vec<FileSystemEntry>,
+    // Prebuilt indices for faster tree building
+    path_map: HashMap<PathBuf, usize>,         // Maps path to index in entries
+    children_map: HashMap<PathBuf, Vec<usize>>, // Maps parent path to indices of children in entries
 }
 
 // New command to scan directory and return complete results at once
@@ -445,6 +559,11 @@ fn build_tree_from_entries(entries: &[FileSystemEntry], root_path: &Path) -> Fil
 async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), String> {
     // Drop any previous resources before starting a new scan
     tokio::task::yield_now().await;
+    
+    // Clear the global cache first when starting a new scan
+    if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
+        *global_cache = None;
+    }
     
     let result = scan_directory_complete(path, window.clone()).await;
     
@@ -460,6 +579,7 @@ async fn scan_directory_size(path: String, window: tauri::Window) -> Result<(), 
     }
 }
 
+// Modified scan_directory_complete function to store results in global cache
 async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io::Result<()> {
     let start_time = std::time::Instant::now();
     
@@ -495,22 +615,22 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     
     // Calculate scan time
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
-    
+
     // Convert the analytics map to a vector of entries
     let entries = analytics_map_to_entries(&analytics_map);
     
-    // Build the tree from the entries
-    let tree = build_tree_from_entries(&entries, &target_dir);
+    // Build the initial tree from the entries with just a basic approach
+    // This will be quick and allows us to show results to the user without waiting for indexing
+    let tree = build_tree_from_entries_with_depth(&entries, &target_dir, 1);
     
     // Create the complete result object
     let result = DirectoryScanResult {
-        root_path: target_dir,
-        entries,
-        tree,
+        root_path: target_dir.clone(),
+        tree: tree.clone(),
         scan_time_ms: elapsed_ms,
     };
     
-    // Send the complete result as a single event
+    // Send the complete result as a single event immediately
     if let Err(e) = window.emit("scan-result", &result) {
         eprintln!("Failed to emit scan result: {}", e);
     }
@@ -520,10 +640,132 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
         eprintln!("Failed to emit completion event: {}", e);
     }
     
-    // Explicitly clear resources
-    drop(analytics_map);
-
+    // Now that the user sees the results, build the indices in the background
+    // Clone what we need for the async task
+    let entries_clone = entries.clone();
+    let target_dir_clone = target_dir.clone();
+    
+    // Spawn a new async task to build the indices
+    tokio::spawn(async move {
+        // Clone values before passing to spawn_blocking to avoid ownership issues
+        let target_dir_for_indices = target_dir_clone.clone();
+        let entries_for_indices = entries_clone.clone();
+        
+        // Use tokio's spawn_blocking to run CPU-intensive parallelized work
+        // This ensures we don't block the async runtime with CPU-bound work
+        let indices_result = tokio::task::spawn_blocking(move || {
+            // Prebuild indices for faster tree building
+            
+            // First pass: build path_map (map from path to index in entries) - parallelize this
+            let path_map = entries_for_indices.par_iter()
+                .enumerate()
+                .map(|(i, entry)| (entry.path.clone(), i))
+                .collect::<HashMap<_, _>>();
+            
+            // Second pass: build children_map
+            // This is harder to fully parallelize so we'll use a concurrent map
+            let children_map = DashMap::new();
+            
+            // Populate the children map in parallel
+            entries_for_indices.par_iter().enumerate().for_each(|(i, entry)| {
+                if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+                    // Skip entries that are outside our target directory
+                    if !parent_path.starts_with(&target_dir_for_indices) && parent_path != target_dir_for_indices {
+                        return;
+                    }
+                    
+                    // Use entry API on DashMap to safely add children indices
+                    children_map.entry(parent_path).or_insert_with(Vec::new).push(i);
+                }
+            });
+            
+            // Convert DashMap to regular HashMap for storage
+            let mut regular_children_map: HashMap<PathBuf, Vec<usize>> = HashMap::with_capacity(children_map.len());
+            
+            // Third pass: collect and sort children by size (largest first) for each parent
+            children_map.into_iter().for_each(|(parent_path, mut indices)| {
+                // Sort indices by size (largest first) - this can be done in parallel for each entry
+                indices.par_sort_by(|&a, &b| {
+                    let size_a = entries_for_indices[a].size_bytes;
+                    let size_b = entries_for_indices[b].size_bytes;
+                    size_b.cmp(&size_a) // Sort largest first
+                });
+                
+                regular_children_map.insert(parent_path, indices);
+            });
+            
+            (path_map, regular_children_map)
+        }).await;
+        
+        // Process the result of the parallel work
+        if let Ok((path_map, children_map)) = indices_result {
+            // Store the results in the global cache
+            let cache = ScanCache {
+                root_path: target_dir_clone,
+                entries: entries_clone,
+                path_map,
+                children_map,
+            };
+            
+            // Update the global cache
+            if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
+                *global_cache = Some(cache);
+            } else {
+                eprintln!("Failed to acquire lock on global cache");
+            }
+        } else {
+            eprintln!("Failed to build indices in background task");
+        }
+    });
+    
     Ok(())
+}
+
+// Updated get_directory_children function to use cached data
+#[tauri::command]
+async fn get_directory_children(path: String) -> Result<FileSystemTreeNode, String> {
+    // Access the global cache
+    let cache_guard = GLOBAL_SCAN_CACHE.lock().map_err(|e| format!("Failed to acquire cache lock: {}", e))?;
+    
+    // Check if we have cached scan data
+    if let Some(cache) = &*cache_guard {
+        // Convert the path to canonical form
+        let target_dir = match Path::new(&path).canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Failed to canonicalize path: {}", e)),
+        };
+        
+        // Check if the requested path is within our cached data (it should be a subpath of the root)
+        if !target_dir.starts_with(&cache.root_path) && target_dir != cache.root_path {
+            return Err(format!("Path {} is not within the scanned directory {}", 
+                               target_dir.display(), cache.root_path.display()));
+        }
+        
+        // Use the prebuilt indices to build the tree (much faster)
+        if let Some(tree) = build_tree_from_indices(
+            &cache.entries,
+            &cache.path_map,
+            &cache.children_map,
+            &target_dir,
+            1 // Just show direct children
+        ) {
+            return Ok(tree);
+        }
+        
+        // If the optimized method failed (unlikely), fall back to the original method
+        let entry = cache.entries.iter().find(|e| e.path == target_dir);
+        
+        if let Some(_) = entry {
+            // Build a tree using the original method
+            let tree = build_tree_from_entries_with_depth(&cache.entries, &target_dir, 1);
+            return Ok(tree);
+        } else {
+            return Err(format!("Path {} not found in scan data", target_dir.display()));
+        }
+    } else {
+        // No cached data available, need to perform a fresh scan
+        return Err("No scan data available. Please scan a directory first.".to_string());
+    }
 }
 
 #[tauri::command]
@@ -539,6 +781,17 @@ fn get_space_info(path: String) -> Result<(u64, u64, u64), String> {
     match platform::get_space_info(&path) {
         Some((total, available, used)) => Ok((total, available, used)),
         None => Err("Failed to get space information".to_string()),
+    }
+}
+
+// Command to clear the scan cache
+#[tauri::command]
+async fn clear_scan_cache() -> Result<(), String> {
+    if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
+        *global_cache = None;
+        Ok(())
+    } else {
+        Err("Failed to acquire lock on global cache".to_string())
     }
 }
 
@@ -558,7 +811,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_directory_size,
             get_free_space,
-            get_space_info
+            get_space_info,
+            get_directory_children, // Add the new command
+            clear_scan_cache // Add cache clearing command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

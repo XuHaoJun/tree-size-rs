@@ -11,13 +11,12 @@ import {
   Folder,
   Percent,
   AlignJustify,
-  SortAsc,
-  SortDesc,
   ChevronRight,
   ChevronDown,
   Settings,
   HelpCircle,
   FolderOpen,
+  LoaderIcon
 } from "lucide-react";
 import {
   Tooltip,
@@ -26,7 +25,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Input } from "@/components/ui/input";
 
 // Extend the TreeViewItem interface to include size data
 interface EnhancedTreeViewItem extends BaseTreeViewItem {
@@ -40,17 +38,8 @@ interface EnhancedTreeViewItem extends BaseTreeViewItem {
   owner: string;
   depth: number;
   backgroundColor?: string;
-}
-
-interface FileSystemEntry {
-  path: string;
-  size_bytes: number;
-  entry_count: number;
-  file_count: number;
-  directory_count: number;
-  allocated_bytes?: number;
-  last_modified?: string;
-  owner?: string;
+  loading?: boolean; // Add loading state for lazy-loaded directories
+  loaded?: boolean;  // Track if directory contents have been loaded
 }
 
 interface FileSystemTreeNode {
@@ -66,21 +55,16 @@ interface FileSystemTreeNode {
 
 interface DirectoryScanResult {
   root_path: string; 
-  entries: FileSystemEntry[];
   tree: FileSystemTreeNode;
   scan_time_ms: number;
 }
 
 export function DirectoryScanner() {
   const [selectedPath, setSelectedPath] = useState<string>("");
-  const [entries, setEntries] = useState<FileSystemEntry[]>([]);
   const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([]);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
-  const [sortBy, setSortBy] = useState<"size" | "count">("size");
-  const [filterValue, setFilterValue] = useState("");
   const [currentTab, setCurrentTab] = useState<
     "file" | "home" | "scan" | "view" | "options" | "help"
   >("scan");
@@ -88,7 +72,6 @@ export function DirectoryScanner() {
   const [totalFiles, setTotalFiles] = useState<number>(0);
   const [freeSpace, setFreeSpace] = useState<string>("N/A");
   const [scanTimeMs, setScanTimeMs] = useState<number>(0);
-  const [filteredTreeData, setFilteredTreeData] = useState<EnhancedTreeViewItem[]>([]);
 
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
@@ -131,6 +114,177 @@ export function DirectoryScanner() {
     // No specific resize handling needed for the new layout
   };
 
+  // Handle expanding a directory - fetch children if needed
+  const handleToggleExpand = async (itemId: string) => {
+    // Find the item in the tree
+    const findItem = (items: EnhancedTreeViewItem[]): EnhancedTreeViewItem | null => {
+      for (const item of items) {
+        if (item.id === itemId) {
+          return item;
+        }
+        const children = item.children as EnhancedTreeViewItem[] | undefined;
+        if (children && children.length > 0) {
+          const found = findItem(children);
+          if (found) {
+            return found;
+          }
+        }
+      }
+      return null;
+    };
+
+    // Toggle the expanded state
+    setExpandedItems((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(itemId)) {
+        newSet.delete(itemId);
+        return newSet;
+      } else {
+        newSet.add(itemId);
+        
+        // Check if we need to load children
+        const item = findItem(treeData);
+        if (item && item.type === "directory" && (!item.loaded || (item.children && item.children.length === 0))) {
+          // Set loading state for this directory
+          const updateLoadingState = (
+            items: EnhancedTreeViewItem[],
+            dirId: string,
+            isLoading: boolean
+          ): EnhancedTreeViewItem[] => {
+            return items.map((item) => {
+              if (item.id === dirId) {
+                return {
+                  ...item,
+                  loading: isLoading,
+                };
+              } else if (item.children) {
+                return {
+                  ...item,
+                  children: updateLoadingState(
+                    item.children as EnhancedTreeViewItem[],
+                    dirId,
+                    isLoading
+                  ),
+                };
+              }
+              return item;
+            });
+          };
+          
+          // Update loading state in the tree
+          setTreeData((prevData) => updateLoadingState(prevData, itemId, true));
+          
+          // Load children asynchronously
+          loadDirectoryChildren(itemId).catch((err) => {
+            console.error("Error loading directory children:", err);
+            setError(`Failed to load directory contents: ${err}`);
+            
+            // Update loading state in the tree (set to false)
+            setTreeData((prevData) => updateLoadingState(prevData, itemId, false));
+          });
+        }
+        
+        return newSet;
+      }
+    });
+  };
+
+  // Function to load directory children from Tauri
+  const loadDirectoryChildren = async (directoryId: string) => {
+    try {
+      // Find the directory in the tree to update it
+      const updateTreeWithChildren = (
+        items: EnhancedTreeViewItem[],
+        dirId: string,
+        newChildren: EnhancedTreeViewItem[]
+      ): EnhancedTreeViewItem[] => {
+        return items.map((item) => {
+          if (item.id === dirId) {
+            return {
+              ...item,
+              children: newChildren,
+              loaded: true,
+              loading: false,
+            };
+          } else if (item.children) {
+            const children = item.children as EnhancedTreeViewItem[];
+            return {
+              ...item,
+              children: updateTreeWithChildren(
+                children,
+                dirId,
+                newChildren
+              ),
+            };
+          }
+          return item;
+        });
+      };
+
+      // Call Tauri to get directory children
+      const result = await invoke<FileSystemTreeNode>("get_directory_children", {
+        path: directoryId,
+      });
+
+      // Convert children to our tree format
+      const children = result.children.map((child) =>
+        convertTreeNodeToTreeViewItem(child, 1) // Set depth to 1
+      );
+
+      // Update tree data with new children
+      setTreeData((prevData) => updateTreeWithChildren(prevData, directoryId, children));
+
+    } catch (err) {
+      console.error("Error loading directory children:", err);
+      
+      // Check if the error is related to missing cache
+      if (String(err).includes("No scan data available")) {
+        // If scan data is missing but we have a selected path, try to rescan
+        if (selectedPath) {
+          setError("Cache data unavailable. Rescanning directory...");
+          
+          // Reset loading state for the directory that failed
+          const updateLoadingState = (
+            items: EnhancedTreeViewItem[],
+            dirId: string,
+            isLoading: boolean
+          ): EnhancedTreeViewItem[] => {
+            return items.map((item) => {
+              if (item.id === dirId) {
+                return {
+                  ...item,
+                  loading: isLoading,
+                };
+              } else if (item.children) {
+                return {
+                  ...item,
+                  children: updateLoadingState(
+                    item.children as EnhancedTreeViewItem[],
+                    dirId,
+                    isLoading
+                  ),
+                };
+              }
+              return item;
+            });
+          };
+          
+          // Update loading state in the tree (set to false)
+          setTreeData((prevData) => updateLoadingState(prevData, directoryId, false));
+          
+          // Attempt to rescan
+          try {
+            await startScan();
+          } catch (scanErr) {
+            setError(`Failed to rescan: ${scanErr}`);
+          }
+        }
+      }
+      
+      throw err;
+    }
+  };
+
   // Convert the Rust tree to our enhanced tree view format
   const convertTreeNodeToTreeViewItem = (
     node: FileSystemTreeNode,
@@ -153,83 +307,8 @@ export function DirectoryScanner() {
       children: node.children.map(child => 
         convertTreeNodeToTreeViewItem(child, depth + 1)
       ),
+      loaded: node.children.length > 0, // Track if children are already loaded
     };
-  };
-
-  // Filter the tree data based on the filter value
-  useEffect(() => {
-    if (!treeData.length || !filterValue.trim()) {
-      setFilteredTreeData(treeData);
-      return;
-    }
-
-    const filterTree = (items: EnhancedTreeViewItem[]): EnhancedTreeViewItem[] => {
-      return items
-        .map(item => {
-          // Check if this item matches the filter
-          const matches = item.name.toLowerCase().includes(filterValue.toLowerCase()) ||
-                         item.id.toLowerCase().includes(filterValue.toLowerCase());
-          
-          // If it has children, filter them too
-          const filteredChildren = item.children 
-            ? filterTree(item.children as EnhancedTreeViewItem[])
-            : [];
-          
-          // Include this item if it matches or has matching children
-          if (matches || filteredChildren.length > 0) {
-            return {
-              ...item,
-              children: filteredChildren.length > 0 ? filteredChildren : item.children,
-            };
-          }
-          
-          // Exclude this item
-          return null;
-        })
-        .filter(Boolean) as EnhancedTreeViewItem[];
-    };
-    
-    setFilteredTreeData(filterTree(treeData));
-    
-    // Auto-expand filtered results
-    const newExpanded = new Set<string>();
-    const collectIds = (items: EnhancedTreeViewItem[]) => {
-      items.forEach(item => {
-        if (item.children && (item.children as EnhancedTreeViewItem[]).length > 0) {
-          newExpanded.add(item.id);
-          collectIds(item.children as EnhancedTreeViewItem[]);
-        }
-      });
-    };
-    
-    collectIds(filterTree(treeData));
-    if (newExpanded.size > 0) {
-      setExpandedItems(newExpanded);
-    }
-  }, [treeData, filterValue]);
-
-  // Sort entries
-  const sortEntries = (
-    entriesToSort: FileSystemEntry[],
-    order: "asc" | "desc",
-    by: "size" | "count"
-  ) => {
-    return [...entriesToSort].sort((a, b) => {
-      const valueA = by === "size" ? a.size_bytes : a.entry_count;
-      const valueB = by === "size" ? b.size_bytes : b.entry_count;
-      return order === "asc" ? valueA - valueB : valueB - valueA;
-    });
-  };
-
-  const toggleSortOrder = () => {
-    const newOrder = sortOrder === "asc" ? "desc" : "asc";
-    setSortOrder(newOrder);
-    setEntries(sortEntries(entries, newOrder, sortBy));
-  };
-
-  const changeSortBy = (by: "size" | "count") => {
-    setSortBy(by);
-    setEntries(sortEntries(entries, sortOrder, by));
   };
 
   const selectDirectory = async () => {
@@ -242,12 +321,20 @@ export function DirectoryScanner() {
       });
 
       if (selected && !Array.isArray(selected)) {
+        // If we're changing directories, clear the cache first
+        if (selectedPath && selectedPath !== selected) {
+          try {
+            await invoke("clear_scan_cache");
+          } catch (err) {
+            console.error("Failed to clear scan cache:", err);
+            // Continue anyway
+          }
+        }
+        
         setSelectedPath(selected);
         
         // Reset any previous scan data when selecting a new directory
-        setEntries([]);
         setTreeData([]);
-        setFilteredTreeData([]);
         setError(null);
       }
     } catch (err) {
@@ -287,10 +374,6 @@ export function DirectoryScanner() {
         // Set scan time
         setScanTimeMs(result.scan_time_ms);
         
-        // Process all entries at once
-        const sortedEntries = sortEntries(result.entries, sortOrder, sortBy);
-        setEntries(sortedEntries);
-        
         // Calculate total size and files
         if (result.tree) {
           setTotalSize(result.tree.size_bytes);
@@ -299,10 +382,9 @@ export function DirectoryScanner() {
           // Convert tree to our format
           const convertedTree = [convertTreeNodeToTreeViewItem(result.tree)];
           setTreeData(convertedTree);
-          setFilteredTreeData(convertedTree);
           
-          // Smart expand the root tree
-          const newExpandedSet = smartExpandTree(convertedTree, new Set(), 10);
+          // No smart expand - only expand the root by default
+          const newExpandedSet = new Set<string>([result.tree.path]);
           setExpandedItems(newExpandedSet);
         }
         
@@ -344,7 +426,7 @@ export function DirectoryScanner() {
         unlistenComplete.then((unlisten) => unlisten());
       }
     };
-  }, [selectedPath, sortOrder, sortBy]);
+  }, [selectedPath]);
 
   const startScan = async () => {
     if (!selectedPath) {
@@ -355,9 +437,7 @@ export function DirectoryScanner() {
     try {
       // Clear state first
       setError(null);
-      setEntries([]);
       setTreeData([]);
-      setFilteredTreeData([]);
       setScanTimeMs(0);
       setScanning(true);
 
@@ -373,96 +453,15 @@ export function DirectoryScanner() {
     }
   };
 
-  // Smart expand the tree to show at least N items
-  const smartExpandTree = (
-    items: EnhancedTreeViewItem[],
-    expandedSet: Set<string>,
-    minItems = 10
-  ): Set<string> => {
-    let visibleCount = items.length;
-    const newExpandedSet = new Set(expandedSet);
-
-    // If we already have enough items visible, no need to expand further
-    if (visibleCount >= minItems) {
-      return newExpandedSet;
-    }
-
-    // Sort items by size to expand the largest directories first
-    const sortedItems = [...items].sort((a, b) => b.sizeBytes - a.sizeBytes);
-
-    // First pass: expand largest directories until we have enough visible items
-    for (const item of sortedItems) {
-      if (visibleCount >= minItems) break;
-
-      if (item.children && item.children.length > 0) {
-        newExpandedSet.add(item.id);
-        visibleCount += item.children.length;
-      }
-    }
-
-    // Second pass: if we still don't have enough items, recursively expand subdirectories
-    if (visibleCount < minItems) {
-      for (const item of sortedItems) {
-        if (
-          newExpandedSet.has(item.id) &&
-          item.children &&
-          item.children.length > 0
-        ) {
-          // Only recurse into directories we've already expanded
-          const childItems = item.children as EnhancedTreeViewItem[];
-          const updatedSet = smartExpandTree(
-            childItems,
-            newExpandedSet,
-            minItems
-          );
-
-          // Update our expanded set with any new expansions
-          for (const id of updatedSet) {
-            newExpandedSet.add(id);
-          }
-
-          // Recalculate visible count
-          visibleCount = countVisibleItems(items, newExpandedSet);
-
-          if (visibleCount >= minItems) break;
-        }
-      }
-    }
-
-    return newExpandedSet;
-  };
-
-  // Count visible items in the tree
-  const countVisibleItems = (
-    items: EnhancedTreeViewItem[],
-    expandedSet: Set<string>
-  ): number => {
-    let count = items.length;
-
-    for (const item of items) {
-      if (expandedSet.has(item.id) && item.children) {
-        count += countVisibleItems(
-          item.children as EnhancedTreeViewItem[],
-          expandedSet
-        );
-      }
-    }
-
-    return count;
-  };
-
-  // Handle toggle expand
-  const handleToggleExpand = (itemId: string) => {
-    setExpandedItems((prev) => {
-      const newSet = new Set(prev);
-      if (newSet.has(itemId)) {
-        newSet.delete(itemId);
-      } else {
-        newSet.add(itemId);
-      }
-      return newSet;
-    });
-  };
+  // Add a cleanup effect to clear the cache when component unmounts
+  useEffect(() => {
+    return () => {
+      // Attempt to clear the cache when the component unmounts
+      invoke("clear_scan_cache").catch(err => {
+        console.error("Failed to clear scan cache on unmount:", err);
+      });
+    };
+  }, []);
 
   return (
     <div className="h-full w-full flex flex-col overflow-hidden" style={{ height: '100vh', maxHeight: '100vh' }}>
@@ -557,25 +556,6 @@ export function DirectoryScanner() {
                       variant="ghost"
                       size="sm"
                       className="h-14 w-14 flex flex-col items-center gap-1"
-                      onClick={toggleSortOrder}
-                    >
-                      {sortOrder === "asc" ? (
-                        <SortAsc className="h-5 w-5" />
-                      ) : (
-                        <SortDesc className="h-5 w-5" />
-                      )}
-                      <span className="text-xs">Sort</span>
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Toggle sort order</TooltipContent>
-                </Tooltip>
-
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-14 w-14 flex flex-col items-center gap-1"
                     >
                       <Settings className="h-5 w-5" />
                       <span className="text-xs">Configure</span>
@@ -619,56 +599,15 @@ export function DirectoryScanner() {
 
       {/* Main content - Scrollable */}
       <div className="flex-grow flex flex-col overflow-hidden h-0">
-        {filteredTreeData.length > 0 ? (
-          <>
-            <div className="p-2 flex justify-between items-center border-b flex-shrink-0 bg-background z-10">
-              <Input
-                type="text"
-                placeholder="Filter files and folders..."
-                value={filterValue}
-                onChange={(e) => setFilterValue(e.target.value)}
-                className="w-64 text-sm"
-              />
-
-              <div className="flex gap-2 items-center">
-                <Button
-                  onClick={toggleSortOrder}
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs"
-                >
-                  {sortOrder === "asc" ? "↑" : "↓"}
-                </Button>
-
-                <Button
-                  onClick={() => changeSortBy("size")}
-                  variant={sortBy === "size" ? "secondary" : "ghost"}
-                  size="sm"
-                  className="text-xs"
-                >
-                  Size
-                </Button>
-
-                <Button
-                  onClick={() => changeSortBy("count")}
-                  variant={sortBy === "count" ? "secondary" : "ghost"}
-                  size="sm"
-                  className="text-xs"
-                >
-                  Count
-                </Button>
-              </div>
-            </div>
-
-            <div className="flex-grow overflow-auto h-0">
-              <TreeSizeView
-                data={filteredTreeData}
-                formatSize={formatSize}
-                expandedItems={expandedItems}
-                onToggleExpand={handleToggleExpand}
-              />
-            </div>
-          </>
+        {treeData.length > 0 ? (
+          <div className="flex-grow overflow-auto h-0">
+            <TreeSizeView
+              data={treeData}
+              formatSize={formatSize}
+              expandedItems={expandedItems}
+              onToggleExpand={handleToggleExpand}
+            />
+          </div>
         ) : (
           <div className="flex items-center justify-center h-full">
             <div className="text-muted p-8 text-center">
@@ -694,7 +633,7 @@ export function DirectoryScanner() {
               Scanning... Please wait
             </span>
           )}
-          {!scanning && filteredTreeData.length > 0 && (
+          {!scanning && treeData.length > 0 && (
             <span>
               {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
               {scanTimeMs > 0 && ` (scanned in ${(scanTimeMs / 1000).toFixed(2)}s)`}
@@ -764,13 +703,14 @@ function TreeSizeItem({
   expandedItems: Set<string>;
 }) {
   const toggleExpand = () => {
-    if (item.children && item.children.length > 0) {
+    // Check if the item is a directory or has children
+    if (item.type === "directory") {
       onToggleExpand(item.id);
     }
   };
 
-  const hasChildren = item.children && item.children.length > 0;
   const isSignificantSize = item.percentOfParent >= 20;
+  const isLoading = item.loading || false;
 
   return (
     <div>
@@ -780,8 +720,10 @@ function TreeSizeItem({
           className="p-1 flex items-center justify-center cursor-pointer"
           onClick={toggleExpand}
         >
-          {hasChildren &&
-            (expanded ? (
+          {item.type === "directory" &&
+            (isLoading ? (
+              <LoaderIcon className="h-4 w-4 animate-spin" />
+            ) : expanded ? (
               <ChevronDown className="h-4 w-4" />
             ) : (
               <ChevronRight className="h-4 w-4" />
