@@ -3,11 +3,12 @@ mod platform;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::fs;
 use dashmap::{DashMap, DashSet};
 use serde::Serialize;
 use tauri::Emitter;
 use std::collections::HashMap;
+use rayon::prelude::*;
+use std::sync::Mutex;
 
 /// Contains analytics information for a directory or file
 #[derive(Debug)]
@@ -106,25 +107,33 @@ fn get_parent_chain_sync(path: &Path, target_dir: Option<&Path>) -> Vec<PathBuf>
     chain
 }
 
-// Asynchronous recursive processing function with deferred event sending
-async fn calculate_size_async(
+// Structure to hold updates that need to be applied to parent directories
+#[allow(dead_code)]
+struct ParentUpdate {
+    path: PathBuf,
+    size_bytes: u64,
+    entry_count: u64,
+    file_count: u64,
+    directory_count: u64,
+}
+
+// Efficient sync function that uses Rayon for parallel processing
+fn calculate_size_sync(
     path: PathBuf,
     analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
     target_dir_path: Option<PathBuf>,
-    visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
-    processed_paths: Option<Arc<DashSet<PathBuf>>>, // Track paths we've already processed
+    visited_inodes: Arc<DashSet<(u64, u64)>>,
+    processed_paths: Arc<DashSet<PathBuf>>,
+    parent_updates: Arc<Mutex<Vec<ParentUpdate>>>,
 ) -> std::io::Result<()> {
-    // Use shared tracking sets
-    let visited = visited_inodes.unwrap_or_else(|| Arc::new(DashSet::new()));
-    let processed = processed_paths.unwrap_or_else(|| Arc::new(DashSet::new()));
-    
     // If we've already processed this path, skip it
-    if !processed.insert(path.clone()) {
+    if !processed_paths.insert(path.clone()) {
         return Ok(());
     }
     
     // Get path info using our platform-agnostic function - will work for files, dirs and symlinks
-    let path_info = match platform::get_path_info(&path, true, path.is_symlink()) {
+    let is_symlink = path.is_symlink();
+    let path_info = match platform::get_path_info(&path, true, is_symlink) {
         Some(info) => info,
         None => return Ok(()),
     };
@@ -132,14 +141,13 @@ async fn calculate_size_async(
     // Check for cycles using device and inode numbers if available
     // This handles both directory cycles AND symlinks properly
     if let Some(inode_pair) = path_info.inode_device {
-        if !visited.insert(inode_pair) {
+        if !visited_inodes.insert(inode_pair) {
             // We've already seen this inode, skip it
             return Ok(());
         }
     }
 
     // Count entry as file or directory, symlinks count as entries but not as files or dirs
-    let is_symlink = path.is_symlink();
     let entry_count = 1; // Count this file/directory/symlink as 1 entry
     let file_count = if path_info.is_dir || is_symlink { 0 } else { 1 };
     let directory_count = if path_info.is_dir && !is_symlink { 1 } else { 0 };
@@ -167,35 +175,35 @@ async fn calculate_size_async(
     
     // For directories, process all children (but don't follow symlinks)
     if path_info.is_dir && !is_symlink {
-        // Collect all subdirectory entries first 
-        let mut entries = Vec::new();
-        let mut read_dir_result = fs::read_dir(&path).await;
+        // Read directory entries
+        let entries = match std::fs::read_dir(&path) {
+            Ok(dir_entries) => {
+                let mut entry_paths = Vec::with_capacity(32); // Pre-allocate for common case
+                for entry_result in dir_entries {
+                    if let Ok(entry) = entry_result {
+                        entry_paths.push(entry.path());
+                    }
+                }
+                entry_paths
+            },
+            Err(_) => Vec::new(),
+        };
         
-        if let Ok(ref mut children) = read_dir_result {
-            while let Some(entry) = children.next_entry().await? {
-                entries.push(entry.path());
-            }
-        }
-        
-        // Process all children recursively
-        for child_path in &entries {
-            // Use Box::pin to handle recursive async calls correctly
-            let future = Box::pin(calculate_size_async(
+        // Process all children in parallel using Rayon
+        entries.par_iter().for_each(|child_path| {
+            let _ = calculate_size_sync(
                 child_path.clone(),
                 analytics_map.clone(),
                 target_dir_path.clone(),
-                Some(visited.clone()),
-                Some(processed.clone()),
-            ));
-            
-            // Await the future
-            if let Err(e) = future.await {
-                eprintln!("Error processing {:?}: {:?}", child_path, e);
-            }
-        }
+                visited_inodes.clone(),
+                processed_paths.clone(),
+                parent_updates.clone(),
+            );
+        });
         
         // Now compute the total size based on children
-        let mut total_size = path_info.size; // Start with directory's own size
+        let dir_own_size = path_info.size; // Start with directory's own size
+        let mut total_size = dir_own_size;  
         let mut total_entries = 1;  // Start with the directory itself
         let mut total_files = 0;    // Directories don't count as files
         let mut total_dirs = 1;     // Count this directory
@@ -241,7 +249,7 @@ async fn calculate_size_async(
         entry_analytics.directory_count.store(total_dirs, Ordering::Relaxed);
     }
     
-    // Update parent directories only after we have fully calculated our own size
+    // Queue parent directory updates for batch processing after all calculations
     if !is_target_dir {
         // Use the final calculated size (which includes all children for directories)
         let size = entry_analytics.size_bytes.load(Ordering::Relaxed);
@@ -250,30 +258,85 @@ async fn calculate_size_async(
         let dirs = entry_analytics.directory_count.load(Ordering::Relaxed);
         
         let parent_chain = get_parent_chain_sync(&path, target_dir_path.as_deref());
+        
+        // Add all parent updates to the queue
+        let mut update_queue = parent_updates.lock().unwrap();
         for parent in parent_chain {
-            // Update parent entries atomically
-            match analytics_map.entry(parent.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(e) => {
-                    let analytics = e.get();
-                    analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
-                    analytics.entry_count.fetch_add(entries, Ordering::Relaxed);
-                    analytics.file_count.fetch_add(files, Ordering::Relaxed);
-                    analytics.directory_count.fetch_add(dirs, Ordering::Relaxed);
-                },
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    let analytics = Arc::new(AnalyticsInfo {
-                        size_bytes: AtomicU64::new(size),
-                        entry_count: AtomicU64::new(entries),
-                        file_count: AtomicU64::new(files),
-                        directory_count: AtomicU64::new(dirs + 1), // +1 because parent is a directory
-                    });
-                    e.insert(analytics);
-                }
-            }
+            update_queue.push(ParentUpdate {
+                path: parent,
+                size_bytes: size,
+                entry_count: entries,
+                file_count: files,
+                directory_count: dirs,
+            });
         }
     }
 
     Ok(())
+}
+
+// Mark as #[allow(dead_code)] since it's kept for API compatibility
+#[allow(dead_code)]
+async fn calculate_size_async(
+    path: PathBuf,
+    analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+    target_dir_path: Option<PathBuf>,
+    visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
+    processed_paths: Option<Arc<DashSet<PathBuf>>>, // Track paths we've already processed
+) -> std::io::Result<()> {
+    // Use shared tracking sets
+    let visited = visited_inodes.unwrap_or_else(|| Arc::new(DashSet::new()));
+    let processed = processed_paths.unwrap_or_else(|| Arc::new(DashSet::new()));
+    
+    // Create a queue for parent updates
+    let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000))); // Pre-allocate for efficiency
+    
+    // Process the directory synchronously with Rayon parallelism
+    let result = calculate_size_sync(
+        path,
+        analytics_map.clone(),
+        target_dir_path,
+        visited,
+        processed,
+        parent_updates.clone(),
+    );
+    
+    // Apply all parent updates in batch
+    let updates = parent_updates.lock().unwrap();
+    
+    // Group updates by parent path for efficiency
+    let mut grouped_updates: HashMap<PathBuf, (u64, u64, u64, u64)> = HashMap::new();
+    for update in updates.iter() {
+        let entry = grouped_updates.entry(update.path.clone()).or_insert((0, 0, 0, 0));
+        entry.0 += update.size_bytes;
+        entry.1 += update.entry_count;
+        entry.2 += update.file_count;
+        entry.3 += update.directory_count;
+    }
+    
+    // Apply the grouped updates
+    for (parent_path, (size, entries, files, dirs)) in grouped_updates {
+        match analytics_map.entry(parent_path.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                let analytics = e.get();
+                analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
+                analytics.entry_count.fetch_add(entries, Ordering::Relaxed);
+                analytics.file_count.fetch_add(files, Ordering::Relaxed);
+                analytics.directory_count.fetch_add(dirs, Ordering::Relaxed);
+            },
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let analytics = Arc::new(AnalyticsInfo {
+                    size_bytes: AtomicU64::new(size),
+                    entry_count: AtomicU64::new(entries),
+                    file_count: AtomicU64::new(files),
+                    directory_count: AtomicU64::new(dirs + 1), // +1 because parent is a directory
+                });
+                e.insert(analytics);
+            }
+        }
+    }
+    
+    result
 }
 
 // This function converts the analytics map to a vector of FileSystemEntry objects
@@ -405,17 +468,27 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
 
-    // Run the calculation without sending events during processing
-    let calc_task = tokio::spawn(calculate_size_async(
-        target_dir.clone(),
-        analytics_map.clone(),
-        Some(target_dir.clone()),
-        Some(visited_inodes.clone()),
-        Some(processed_paths.clone()),
-    ));
+    // Run the calculation using tokio's spawn_blocking for CPU-intensive work
+    // This allows the expensive calculation to run without blocking other Tokio tasks
+    let analytics_map_clone = analytics_map.clone();
+    let target_dir_clone = target_dir.clone();
+    let scan_task = tokio::task::spawn_blocking(move || {
+        // Create parent updates collection
+        let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000)));
+        
+        // Run the synchronous calculation using Rayon's parallel processing
+        calculate_size_sync(
+            target_dir_clone.clone(),
+            analytics_map_clone.clone(),
+            Some(target_dir_clone.clone()),
+            visited_inodes,
+            processed_paths,
+            parent_updates,
+        )
+    });
 
     // Wait for calculation to complete and handle any errors
-    if let Err(e) = calc_task.await? {
+    if let Err(e) = scan_task.await? {
         eprintln!("Error during directory calculation: {}", e);
         return Err(e);
     }
@@ -449,8 +522,6 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     
     // Explicitly clear resources
     drop(analytics_map);
-    drop(visited_inodes);
-    drop(processed_paths);
 
     Ok(())
 }
@@ -509,15 +580,18 @@ mod tests {
         // Create analytics map and visited inodes
         let analytics_map = Arc::new(DashMap::new());
         let visited_inodes = Arc::new(DashSet::new());
+        let processed_paths = Arc::new(DashSet::new());
+        let parent_updates = Arc::new(Mutex::new(Vec::new()));
         
         // Run the function
-        calculate_size_async(
+        calculate_size_sync(
             path.clone(),
             analytics_map.clone(),
             None, // No target directory
-            Some(visited_inodes),
-            Some(Arc::new(DashSet::new())),
-        ).await?;
+            visited_inodes,
+            processed_paths,
+            parent_updates,
+        )?;
         
         // Verify the results
         assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
@@ -553,15 +627,18 @@ mod tests {
         // Create analytics map and visited inodes
         let analytics_map = Arc::new(DashMap::new());
         let visited_inodes = Arc::new(DashSet::new());
+        let processed_paths = Arc::new(DashSet::new());
+        let parent_updates = Arc::new(Mutex::new(Vec::new()));
         
         // Run the function
-        calculate_size_async(
+        calculate_size_sync(
             path.clone(),
             analytics_map.clone(),
             None,
-            Some(visited_inodes),
-            Some(Arc::new(DashSet::new())),
-        ).await?;
+            visited_inodes,
+            processed_paths,
+            parent_updates,
+        )?;
         
         // Verify the results
         assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
@@ -601,15 +678,18 @@ mod tests {
         // Create analytics map and visited inodes
         let analytics_map = Arc::new(DashMap::new());
         let visited_inodes = Arc::new(DashSet::new());
+        let processed_paths = Arc::new(DashSet::new());
+        let parent_updates = Arc::new(Mutex::new(Vec::new()));
         
         // Run the function
-        calculate_size_async(
+        calculate_size_sync(
             path.clone(),
             analytics_map.clone(),
             None,
-            Some(visited_inodes),
-            Some(Arc::new(DashSet::new())),
-        ).await?;
+            visited_inodes,
+            processed_paths,
+            parent_updates,
+        )?;
         
         // Verify the results for the root directory
         assert!(analytics_map.contains_key(&path), "Root path should be in the analytics map");
@@ -659,15 +739,18 @@ mod tests {
         // Create analytics map and visited inodes
         let analytics_map = Arc::new(DashMap::new());
         let visited_inodes = Arc::new(DashSet::new());
+        let processed_paths = Arc::new(DashSet::new());
+        let parent_updates = Arc::new(Mutex::new(Vec::new()));
         
         // Run the function
-        calculate_size_async(
+        calculate_size_sync(
             path.clone(),
             analytics_map.clone(),
             None,
-            Some(visited_inodes),
-            Some(Arc::new(DashSet::new())),
-        ).await?;
+            visited_inodes,
+            processed_paths,
+            parent_updates,
+        )?;
         
         // Verify the results
         assert!(analytics_map.contains_key(&path), "Path should be in the analytics map");
@@ -682,6 +765,77 @@ mod tests {
         
         // Let's also check that the symlink exists
         assert!(symlink_path.exists(), "Symlink should exist");
+        
+        Ok(())
+    }
+
+    // A manual benchmark that can be run with cargo test -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn benchmark_rayon_parallel_vs_sequential() -> std::io::Result<()> {
+        // Choose a directory to scan - use home directory for a more realistic test
+        let test_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+            .to_path_buf();
+        
+        println!("Benchmarking directory: {:?}", test_dir);
+        
+        // First measure with parallelism
+        let start = std::time::Instant::now();
+        {
+            let analytics_map = Arc::new(DashMap::new());
+            let visited_inodes = Arc::new(DashSet::new());
+            let processed_paths = Arc::new(DashSet::new());
+            let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000)));
+            
+            // Use Rayon's default thread pool (parallel)
+            calculate_size_sync(
+                test_dir.clone(),
+                analytics_map.clone(),
+                None,
+                visited_inodes,
+                processed_paths,
+                parent_updates,
+            )?;
+            
+            println!("Parallel scan found {} entries", analytics_map.len());
+        }
+        let parallel_duration = start.elapsed();
+        println!("Parallel processing took: {:?}", parallel_duration);
+        
+        // Then measure with single thread
+        let start = std::time::Instant::now();
+        {
+            let analytics_map = Arc::new(DashMap::new());
+            let visited_inodes = Arc::new(DashSet::new());
+            let processed_paths = Arc::new(DashSet::new());
+            let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000)));
+            
+            // Create a single-threaded pool to simulate sequential processing
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            
+            pool.install(|| {
+                let _ = calculate_size_sync(
+                    test_dir.clone(),
+                    analytics_map.clone(),
+                    None,
+                    visited_inodes,
+                    processed_paths,
+                    parent_updates,
+                );
+            });
+            
+            println!("Sequential scan found {} entries", analytics_map.len());
+        }
+        let sequential_duration = start.elapsed();
+        println!("Sequential processing took: {:?}", sequential_duration);
+        
+        // Calculate and print the speedup
+        let speedup = sequential_duration.as_secs_f64() / parallel_duration.as_secs_f64();
+        println!("Speedup from parallelism: {:.2}x", speedup);
         
         Ok(())
     }

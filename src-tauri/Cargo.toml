@@ -39,7 +39,9 @@ dashmap = "6"
 tokio = { version = "1", features = ["fs", "io-std", "rt-multi-thread", "sync", "time", "macros"] }
 kanal = "0.1.0-pre8"
 sysinfo = { version = "0.33.1", features = ["disk"] }
+rayon = "1"
 log = "0.4.26"
+dirs = "5"
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1"
