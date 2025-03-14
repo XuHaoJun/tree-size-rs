@@ -647,49 +647,74 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     
     // Spawn a new async task to build the indices
     tokio::spawn(async move {
-        // Prebuild indices for faster tree building
-        let mut path_map = HashMap::with_capacity(entries_clone.len());
-        let mut children_map = HashMap::new();
+        // Clone values before passing to spawn_blocking to avoid ownership issues
+        let target_dir_for_indices = target_dir_clone.clone();
+        let entries_for_indices = entries_clone.clone();
         
-        // First pass: build path_map (map from path to index in entries)
-        for (i, entry) in entries_clone.iter().enumerate() {
-            path_map.insert(entry.path.clone(), i);
-        }
-        
-        // Second pass: build children_map (map from parent path to indices of children)
-        for (i, entry) in entries_clone.iter().enumerate() {
-            if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
-                // Skip entries that are outside our target directory
-                if !parent_path.starts_with(&target_dir_clone) && parent_path != target_dir_clone {
-                    continue;
+        // Use tokio's spawn_blocking to run CPU-intensive parallelized work
+        // This ensures we don't block the async runtime with CPU-bound work
+        let indices_result = tokio::task::spawn_blocking(move || {
+            // Prebuild indices for faster tree building
+            
+            // First pass: build path_map (map from path to index in entries) - parallelize this
+            let path_map = entries_for_indices.par_iter()
+                .enumerate()
+                .map(|(i, entry)| (entry.path.clone(), i))
+                .collect::<HashMap<_, _>>();
+            
+            // Second pass: build children_map
+            // This is harder to fully parallelize so we'll use a concurrent map
+            let children_map = DashMap::new();
+            
+            // Populate the children map in parallel
+            entries_for_indices.par_iter().enumerate().for_each(|(i, entry)| {
+                if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+                    // Skip entries that are outside our target directory
+                    if !parent_path.starts_with(&target_dir_for_indices) && parent_path != target_dir_for_indices {
+                        return;
+                    }
+                    
+                    // Use entry API on DashMap to safely add children indices
+                    children_map.entry(parent_path).or_insert_with(Vec::new).push(i);
                 }
-                
-                children_map.entry(parent_path).or_insert_with(Vec::new).push(i);
-            }
-        }
-        
-        // Third pass: sort children by size (largest first) for each parent
-        for (_, indices) in children_map.iter_mut() {
-            indices.sort_by(|&a, &b| {
-                let size_a = entries_clone[a].size_bytes;
-                let size_b = entries_clone[b].size_bytes;
-                size_b.cmp(&size_a) // Sort largest first
             });
-        }
+            
+            // Convert DashMap to regular HashMap for storage
+            let mut regular_children_map: HashMap<PathBuf, Vec<usize>> = HashMap::with_capacity(children_map.len());
+            
+            // Third pass: collect and sort children by size (largest first) for each parent
+            children_map.into_iter().for_each(|(parent_path, mut indices)| {
+                // Sort indices by size (largest first) - this can be done in parallel for each entry
+                indices.par_sort_by(|&a, &b| {
+                    let size_a = entries_for_indices[a].size_bytes;
+                    let size_b = entries_for_indices[b].size_bytes;
+                    size_b.cmp(&size_a) // Sort largest first
+                });
+                
+                regular_children_map.insert(parent_path, indices);
+            });
+            
+            (path_map, regular_children_map)
+        }).await;
         
-        // Store the results in the global cache
-        let cache = ScanCache {
-            root_path: target_dir_clone,
-            entries: entries_clone,
-            path_map,
-            children_map,
-        };
-        
-        // Update the global cache
-        if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
-            *global_cache = Some(cache);
+        // Process the result of the parallel work
+        if let Ok((path_map, children_map)) = indices_result {
+            // Store the results in the global cache
+            let cache = ScanCache {
+                root_path: target_dir_clone,
+                entries: entries_clone,
+                path_map,
+                children_map,
+            };
+            
+            // Update the global cache
+            if let Ok(mut global_cache) = GLOBAL_SCAN_CACHE.lock() {
+                *global_cache = Some(cache);
+            } else {
+                eprintln!("Failed to acquire lock on global cache");
+            }
         } else {
-            eprintln!("Failed to acquire lock on global cache");
+            eprintln!("Failed to build indices in background task");
         }
     });
     
