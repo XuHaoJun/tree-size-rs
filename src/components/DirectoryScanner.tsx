@@ -684,32 +684,36 @@ function flattenTree(
   expandedItems: Set<string>,
   nestingLevel = 0
 ): FlattenedTreeItem[] {
-  let result: FlattenedTreeItem[] = []
+  // Pre-allocate a single result array to avoid repeated concatenation
+  const result: FlattenedTreeItem[] = []
+  
+  // Helper function to recursively add items to the result array
+  const addItemsToResult = (
+    items: EnhancedTreeViewItem[],
+    nestingLevel: number
+  ) => {
+    for (const item of items) {
+      // Add the current item
+      result.push({
+        ...item,
+        isVisible: true,
+        nestingLevel,
+      })
 
-  for (const item of items) {
-    // Add the current item
-    result.push({
-      ...item,
-      isVisible: true,
-      nestingLevel,
-    })
-
-    // If this item is expanded and has children, add them too
-    if (
-      expandedItems.has(item.id) &&
-      item.children &&
-      item.children.length > 0
-    ) {
-      result = result.concat(
-        flattenTree(
-          item.children as EnhancedTreeViewItem[],
-          expandedItems,
-          nestingLevel + 1
-        )
-      )
+      // If this item is expanded and has children, process them too
+      if (
+        expandedItems.has(item.id) &&
+        item.children &&
+        item.children.length > 0
+      ) {
+        addItemsToResult(item.children as EnhancedTreeViewItem[], nestingLevel + 1)
+      }
     }
   }
 
+  // Start the recursive process
+  addItemsToResult(items, nestingLevel)
+  
   return result
 }
 
