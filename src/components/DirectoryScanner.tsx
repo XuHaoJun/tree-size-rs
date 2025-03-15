@@ -68,7 +68,7 @@ interface DirectoryScanResult {
 
 // New interface for flattened tree items
 interface FlattenedTreeItem extends EnhancedTreeViewItem {
-  isVisible: boolean
+  shouldRender: boolean
   nestingLevel: number
 }
 
@@ -686,7 +686,7 @@ function flattenTree(
 ): FlattenedTreeItem[] {
   // Pre-allocate a single result array to avoid repeated concatenation
   const result: FlattenedTreeItem[] = []
-  
+
   // Helper function to recursively add items to the result array
   const addItemsToResult = (
     items: EnhancedTreeViewItem[],
@@ -696,7 +696,7 @@ function flattenTree(
       // Add the current item
       result.push({
         ...item,
-        isVisible: true,
+        shouldRender: true,
         nestingLevel,
       })
 
@@ -706,14 +706,17 @@ function flattenTree(
         item.children &&
         item.children.length > 0
       ) {
-        addItemsToResult(item.children as EnhancedTreeViewItem[], nestingLevel + 1)
+        addItemsToResult(
+          item.children as EnhancedTreeViewItem[],
+          nestingLevel + 1
+        )
       }
     }
   }
 
   // Start the recursive process
   addItemsToResult(items, nestingLevel)
-  
+
   return result
 }
 
