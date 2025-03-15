@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    tree_size_rs_lib::run()
+  tree_size_rs_lib::run()
 }

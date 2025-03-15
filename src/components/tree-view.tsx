@@ -1,100 +1,107 @@
-"use client";
+"use client"
 
-import { useState, useRef, useEffect, useCallback, useMemo, JSX } from "react";
-import { Button } from "@/components/ui/button";
+import { JSX, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { AnimatePresence, motion } from "framer-motion"
+import {
+  Box,
+  ChevronDown,
+  ChevronRight,
+  Folder,
+  Info,
+  Search,
+  X,
+} from "lucide-react"
+
+import { cn } from "@/lib/utils"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import {
   Collapsible,
-  CollapsibleTrigger,
   CollapsibleContent,
-} from "@/components/ui/collapsible";
-import { Folder, ChevronRight, ChevronDown, Box, Search } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
 import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuTrigger,
-} from "@/components/ui/context-menu";
-import { X } from "lucide-react";
+} from "@/components/ui/context-menu"
 import {
   HoverCard,
   HoverCardContent,
   HoverCardTrigger,
-} from "@/components/ui/hover-card";
-import { Info } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
-import { Input } from "@/components/ui/input";
+} from "@/components/ui/hover-card"
+import { Input } from "@/components/ui/input"
 
 export interface TreeViewItem {
-  id: string;
-  name: string;
-  type: string;
-  children?: TreeViewItem[];
-  checked?: boolean;
+  id: string
+  name: string
+  type: string
+  children?: TreeViewItem[]
+  checked?: boolean
 }
 
 export interface TreeViewIconMap {
-  [key: string]: React.ReactNode | undefined;
+  [key: string]: React.ReactNode | undefined
 }
 
 export interface TreeViewMenuItem {
-  id: string;
-  label: string;
-  icon?: React.ReactNode;
-  action: (items: TreeViewItem[]) => void;
+  id: string
+  label: string
+  icon?: React.ReactNode
+  action: (items: TreeViewItem[]) => void
 }
 
 export interface TreeViewProps {
-  className?: string;
-  data: TreeViewItem[];
-  title?: string;
-  showExpandAll?: boolean;
-  showCheckboxes?: boolean;
-  checkboxPosition?: "left" | "right";
-  searchPlaceholder?: string;
-  selectionText?: string;
+  className?: string
+  data: TreeViewItem[]
+  title?: string
+  showExpandAll?: boolean
+  showCheckboxes?: boolean
+  checkboxPosition?: "left" | "right"
+  searchPlaceholder?: string
+  selectionText?: string
   checkboxLabels?: {
-    check: string;
-    uncheck: string;
-  };
-  getIcon?: (item: TreeViewItem, depth: number) => React.ReactNode;
-  onSelectionChange?: (selectedItems: TreeViewItem[]) => void;
-  onAction?: (action: string, items: TreeViewItem[]) => void;
-  onCheckChange?: (item: TreeViewItem, checked: boolean) => void;
-  iconMap?: TreeViewIconMap;
-  menuItems?: TreeViewMenuItem[];
+    check: string
+    uncheck: string
+  }
+  getIcon?: (item: TreeViewItem, depth: number) => React.ReactNode
+  onSelectionChange?: (selectedItems: TreeViewItem[]) => void
+  onAction?: (action: string, items: TreeViewItem[]) => void
+  onCheckChange?: (item: TreeViewItem, checked: boolean) => void
+  iconMap?: TreeViewIconMap
+  menuItems?: TreeViewMenuItem[]
 }
 
 interface TreeItemProps {
-  item: TreeViewItem;
-  depth?: number;
-  selectedIds: Set<string>;
-  lastSelectedId: React.MutableRefObject<string | null>;
-  onSelect: (ids: Set<string>) => void;
-  expandedIds: Set<string>;
-  onToggleExpand: (id: string, isOpen: boolean) => void;
-  getIcon?: (item: TreeViewItem, depth: number) => React.ReactNode;
-  onAction?: (action: string, items: TreeViewItem[]) => void;
-  onAccessChange?: (item: TreeViewItem, hasAccess: boolean) => void;
-  allItems: TreeViewItem[];
-  showAccessRights?: boolean;
-  itemMap: Map<string, TreeViewItem>;
-  iconMap?: TreeViewIconMap;
-  menuItems?: TreeViewMenuItem[];
-  getSelectedItems: () => TreeViewItem[];
+  item: TreeViewItem
+  depth?: number
+  selectedIds: Set<string>
+  lastSelectedId: React.MutableRefObject<string | null>
+  onSelect: (ids: Set<string>) => void
+  expandedIds: Set<string>
+  onToggleExpand: (id: string, isOpen: boolean) => void
+  getIcon?: (item: TreeViewItem, depth: number) => React.ReactNode
+  onAction?: (action: string, items: TreeViewItem[]) => void
+  onAccessChange?: (item: TreeViewItem, hasAccess: boolean) => void
+  allItems: TreeViewItem[]
+  showAccessRights?: boolean
+  itemMap: Map<string, TreeViewItem>
+  iconMap?: TreeViewIconMap
+  menuItems?: TreeViewMenuItem[]
+  getSelectedItems: () => TreeViewItem[]
 }
 
 // Helper function to build a map of all items by ID
 const buildItemMap = (items: TreeViewItem[]): Map<string, TreeViewItem> => {
-  const map = new Map<string, TreeViewItem>();
+  const map = new Map<string, TreeViewItem>()
   const processItem = (item: TreeViewItem) => {
-    map.set(item.id, item);
-    item.children?.forEach(processItem);
-  };
-  items.forEach(processItem);
-  return map;
-};
+    map.set(item.id, item)
+    item.children?.forEach(processItem)
+  }
+  items.forEach(processItem)
+  return map
+}
 
 // Update the getCheckState function to work bottom-up
 const getCheckState = (
@@ -102,44 +109,44 @@ const getCheckState = (
   itemMap: Map<string, TreeViewItem>
 ): "checked" | "unchecked" | "indeterminate" => {
   // Get the original item from the map
-  const originalItem = itemMap.get(item.id);
-  if (!originalItem) return "unchecked";
+  const originalItem = itemMap.get(item.id)
+  if (!originalItem) return "unchecked"
 
   // If it's a leaf node (no children), return its check state
   if (!originalItem.children || originalItem.children.length === 0) {
-    return originalItem.checked ? "checked" : "unchecked";
+    return originalItem.checked ? "checked" : "unchecked"
   }
 
   // Count the check states of immediate children
-  let checkedCount = 0;
-  let indeterminateCount = 0;
+  let checkedCount = 0
+  let indeterminateCount = 0
 
   originalItem.children.forEach((child) => {
-    const childState = getCheckState(child, itemMap);
-    if (childState === "checked") checkedCount++;
-    if (childState === "indeterminate") indeterminateCount++;
-  });
+    const childState = getCheckState(child, itemMap)
+    if (childState === "checked") checkedCount++
+    if (childState === "indeterminate") indeterminateCount++
+  })
 
   // Calculate parent state based on children states
-  const totalChildren = originalItem.children.length;
+  const totalChildren = originalItem.children.length
 
   // If all children are checked
   if (checkedCount === totalChildren) {
-    return "checked";
+    return "checked"
   }
   // If any child is checked or indeterminate
   if (checkedCount > 0 || indeterminateCount > 0) {
-    return "indeterminate";
+    return "indeterminate"
   }
   // If no children are checked or indeterminate
-  return "unchecked";
-};
+  return "unchecked"
+}
 
 // Add this default icon map
 const defaultIconMap: TreeViewIconMap = {
   file: <Box className="h-4 w-4 text-red-600" />,
   folder: <Folder className="h-4 w-4 text-primary/80" />,
-};
+}
 
 function TreeItem({
   item,
@@ -159,128 +166,121 @@ function TreeItem({
   menuItems,
   getSelectedItems,
 }: TreeItemProps): JSX.Element {
-  const isOpen = expandedIds.has(item.id);
-  const isSelected = selectedIds.has(item.id);
-  const itemRef = useRef<HTMLDivElement>(null);
-  const [selectionStyle, setSelectionStyle] = useState("");
+  const isOpen = expandedIds.has(item.id)
+  const isSelected = selectedIds.has(item.id)
+  const itemRef = useRef<HTMLDivElement>(null)
+  const [selectionStyle, setSelectionStyle] = useState("")
 
   // Get all visible items in order
   const getVisibleItems = useCallback(
     (items: TreeViewItem[]): TreeViewItem[] => {
-      let visibleItems: TreeViewItem[] = [];
+      let visibleItems: TreeViewItem[] = []
 
       items.forEach((item) => {
-        visibleItems.push(item);
+        visibleItems.push(item)
         if (item.children && expandedIds.has(item.id)) {
-          visibleItems = [...visibleItems, ...getVisibleItems(item.children)];
+          visibleItems = [...visibleItems, ...getVisibleItems(item.children)]
         }
-      });
+      })
 
-      return visibleItems;
+      return visibleItems
     },
     [expandedIds]
-  );
+  )
 
   useEffect(() => {
     if (!isSelected) {
-      setSelectionStyle("");
-      return;
+      setSelectionStyle("")
+      return
     }
 
     // Get all visible items from the entire tree
-    const visibleItems = getVisibleItems(allItems);
-    const currentIndex = visibleItems.findIndex((i) => i.id === item.id);
+    const visibleItems = getVisibleItems(allItems)
+    const currentIndex = visibleItems.findIndex((i) => i.id === item.id)
 
-    const prevItem = visibleItems[currentIndex - 1];
-    const nextItem = visibleItems[currentIndex + 1];
+    const prevItem = visibleItems[currentIndex - 1]
+    const nextItem = visibleItems[currentIndex + 1]
 
-    const isPrevSelected = prevItem && selectedIds.has(prevItem.id);
-    const isNextSelected = nextItem && selectedIds.has(nextItem.id);
+    const isPrevSelected = prevItem && selectedIds.has(prevItem.id)
+    const isNextSelected = nextItem && selectedIds.has(nextItem.id)
 
-    const roundTop = !isPrevSelected;
-    const roundBottom = !isNextSelected;
+    const roundTop = !isPrevSelected
+    const roundBottom = !isNextSelected
 
     setSelectionStyle(
       `${roundTop ? "rounded-t-md" : ""} ${roundBottom ? "rounded-b-md" : ""}`
-    );
-  }, [
-    isSelected,
-    selectedIds,
-    expandedIds,
-    item.id,
-    getVisibleItems,
-    allItems,
-  ]);
+    )
+  }, [isSelected, selectedIds, expandedIds, item.id, getVisibleItems, allItems])
 
   const handleClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    e.preventDefault();
+    e.stopPropagation()
+    e.preventDefault()
 
-    let newSelection = new Set(selectedIds);
+    let newSelection = new Set(selectedIds)
 
-    if (!itemRef.current) return;
+    if (!itemRef.current) return
 
     if (e.shiftKey && lastSelectedId.current !== null) {
       const items = Array.from(
         document.querySelectorAll("[data-tree-item]")
-      ) as HTMLElement[];
+      ) as HTMLElement[]
       const lastIndex = items.findIndex(
         (el) => el.getAttribute("data-id") === lastSelectedId.current
-      );
-      const currentIndex = items.findIndex((el) => el === itemRef.current);
+      )
+      const currentIndex = items.findIndex((el) => el === itemRef.current)
       const [start, end] = [
         Math.min(lastIndex, currentIndex),
         Math.max(lastIndex, currentIndex),
-      ];
+      ]
 
       items.slice(start, end + 1).forEach((el) => {
-        const id = el.getAttribute("data-id");
-        const parentFolderClosed = el.closest('[data-folder-closed="true"]');
-        const isClosedFolder = el.getAttribute("data-folder-closed") === "true";
+        const id = el.getAttribute("data-id")
+        const parentFolderClosed = el.closest('[data-folder-closed="true"]')
+        const isClosedFolder = el.getAttribute("data-folder-closed") === "true"
 
         if (id && (isClosedFolder || !parentFolderClosed)) {
-          newSelection.add(id);
+          newSelection.add(id)
         }
-      });
+      })
     } else if (e.ctrlKey || e.metaKey) {
       if (newSelection.has(item.id)) {
-        newSelection.delete(item.id);
+        newSelection.delete(item.id)
       } else {
-        newSelection.add(item.id);
+        newSelection.add(item.id)
       }
     } else {
-      newSelection = new Set([item.id]);
+      newSelection = new Set([item.id])
       // Open folder on single click if it's a folder
       if (item.children && isSelected) {
-        onToggleExpand(item.id, !isOpen);
+        onToggleExpand(item.id, !isOpen)
       }
     }
 
-    lastSelectedId.current = item.id;
-    onSelect(newSelection);
-  };
+    lastSelectedId.current = item.id
+    onSelect(newSelection)
+  }
 
   const handleAccessClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
+    e.stopPropagation()
     if (onAccessChange) {
-      const currentState = getCheckState(item, itemMap);
+      const currentState = getCheckState(item, itemMap)
       // Toggle between checked and unchecked, treating indeterminate as unchecked
-      const newChecked = currentState === "checked" ? false : true;
-      onAccessChange(item, newChecked);
+      const newChecked = currentState === "checked" ? false : true
+      onAccessChange(item, newChecked)
     }
-  };
+  }
 
   const renderIcon = () => {
     if (getIcon) {
-      return getIcon(item, depth);
+      return getIcon(item, depth)
     }
 
     // Use the provided iconMap or fall back to default
-    return iconMap[item.type] || iconMap.folder || defaultIconMap.folder;
-  };
+    return iconMap[item.type] || iconMap.folder || defaultIconMap.folder
+  }
 
   const getItemPath = (item: TreeViewItem, items: TreeViewItem[]): string => {
-    const path: string[] = [item.name];
+    const path: string[] = [item.name]
 
     const findParent = (
       currentItem: TreeViewItem,
@@ -290,41 +290,41 @@ function TreeItem({
         if (
           potentialParent.children?.some((child) => child.id === currentItem.id)
         ) {
-          path.unshift(potentialParent.name);
-          findParent(potentialParent, allItems);
-          break;
+          path.unshift(potentialParent.name)
+          findParent(potentialParent, allItems)
+          break
         }
         if (potentialParent.children) {
-          findParent(currentItem, potentialParent.children);
+          findParent(currentItem, potentialParent.children)
         }
       }
-    };
+    }
 
-    findParent(item, items);
-    return path.join(" → ");
-  };
+    findParent(item, items)
+    return path.join(" → ")
+  }
 
   // Add function to count selected items in a folder
   const getSelectedChildrenCount = (item: TreeViewItem): number => {
-    let count = 0;
+    let count = 0
 
-    if (!item.children) return 0;
+    if (!item.children) return 0
 
     item.children.forEach((child) => {
       if (selectedIds.has(child.id)) {
-        count++;
+        count++
       }
       if (child.children) {
-        count += getSelectedChildrenCount(child);
+        count += getSelectedChildrenCount(child)
       }
-    });
+    })
 
-    return count;
-  };
+    return count
+  }
 
   // Get selected count only if item has children and is collapsed
   const selectedCount =
-    (item.children && !isOpen && getSelectedChildrenCount(item)) || null;
+    (item.children && !isOpen && getSelectedChildrenCount(item)) || null
 
   return (
     <ContextMenu>
@@ -558,8 +558,8 @@ function TreeItem({
             onClick={() => {
               const items = selectedIds.has(item.id)
                 ? getSelectedItems()
-                : [item];
-              menuItem.action(items);
+                : [item]
+              menuItem.action(items)
             }}
           >
             {menuItem.icon && (
@@ -570,7 +570,7 @@ function TreeItem({
         ))}
       </ContextMenuContent>
     </ContextMenu>
-  );
+  )
 }
 
 export default function TreeView({
@@ -591,276 +591,274 @@ export default function TreeView({
   onCheckChange,
   menuItems,
 }: TreeViewProps) {
-  const [currentMousePos, setCurrentMousePos] = useState<number>(0);
-  const [dragStart, setDragStart] = useState<number | null>(null);
+  const [currentMousePos, setCurrentMousePos] = useState<number>(0)
+  const [dragStart, setDragStart] = useState<number | null>(null)
   const [dragStartPosition, setDragStartPosition] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-  const [isDragging, setIsDragging] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [searchQuery, setSearchQuery] = useState("");
+    x: number
+    y: number
+  } | null>(null)
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
+  const [isDragging, setIsDragging] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [searchQuery, setSearchQuery] = useState("")
 
-  const dragRef = useRef<HTMLDivElement>(null);
-  const lastSelectedId = useRef<string | null>(null);
-  const treeRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<HTMLDivElement>(null)
+  const lastSelectedId = useRef<string | null>(null)
+  const treeRef = useRef<HTMLDivElement>(null)
 
-  const DRAG_THRESHOLD = 10; // pixels
+  const DRAG_THRESHOLD = 10 // pixels
 
   // Create a map of all items by ID
-  const itemMap = useMemo(() => buildItemMap(data), [data]);
+  const itemMap = useMemo(() => buildItemMap(data), [data])
 
   // Memoize the search results and expanded IDs
   const { filteredData, searchExpandedIds } = useMemo(() => {
     if (!searchQuery.trim()) {
-      return { filteredData: data, searchExpandedIds: new Set<string>() };
+      return { filteredData: data, searchExpandedIds: new Set<string>() }
     }
 
-    const searchLower = searchQuery.toLowerCase();
-    const newExpandedIds = new Set<string>();
+    const searchLower = searchQuery.toLowerCase()
+    const newExpandedIds = new Set<string>()
 
     // Helper function to check if an item or its descendants match the search
     const itemMatches = (item: TreeViewItem): boolean => {
-      const nameMatches = item.name.toLowerCase().includes(searchLower);
-      if (nameMatches) return true;
+      const nameMatches = item.name.toLowerCase().includes(searchLower)
+      if (nameMatches) return true
 
       if (item.children) {
-        return item.children.some((child) => itemMatches(child));
+        return item.children.some((child) => itemMatches(child))
       }
 
-      return false;
-    };
+      return false
+    }
 
     // Helper function to filter tree while keeping parent structure
     const filterTree = (items: TreeViewItem[]): TreeViewItem[] => {
       return items
         .map((item) => {
           if (!item.children) {
-            return itemMatches(item) ? item : null;
+            return itemMatches(item) ? item : null
           }
 
-          const filteredChildren = filterTree(item.children);
+          const filteredChildren = filterTree(item.children)
           if (filteredChildren.length > 0 || itemMatches(item)) {
             if (item.children) {
-              newExpandedIds.add(item.id);
+              newExpandedIds.add(item.id)
             }
             return {
               ...item,
               children: filteredChildren,
-            };
+            }
           }
-          return null;
+          return null
         })
-        .filter((item): item is TreeViewItem => item !== null);
-    };
+        .filter((item): item is TreeViewItem => item !== null)
+    }
 
     return {
       filteredData: filterTree(data),
       searchExpandedIds: newExpandedIds,
-    };
-  }, [data, searchQuery]);
+    }
+  }, [data, searchQuery])
 
   // Update expanded IDs when search changes
   useEffect(() => {
     if (searchQuery.trim()) {
-      setExpandedIds((prev) => new Set([...prev, ...searchExpandedIds]));
+      setExpandedIds((prev) => new Set([...prev, ...searchExpandedIds]))
     }
-  }, [searchExpandedIds, searchQuery]);
+  }, [searchExpandedIds, searchQuery])
 
   useEffect(() => {
     const handleClickAway = (e: MouseEvent) => {
-      const target = e.target as Element;
+      const target = e.target as Element
 
       const clickedInside =
         (treeRef.current && treeRef.current.contains(target)) ||
         (dragRef.current && dragRef.current.contains(target)) ||
         // Ignore clicks on context menus
         target.closest('[role="menu"]') ||
-        target.closest("[data-radix-popper-content-wrapper]");
+        target.closest("[data-radix-popper-content-wrapper]")
 
       if (!clickedInside) {
-        setSelectedIds(new Set());
-        lastSelectedId.current = null;
+        setSelectedIds(new Set())
+        lastSelectedId.current = null
       }
-    };
+    }
 
-    document.addEventListener("mousedown", handleClickAway);
-    return () => document.removeEventListener("mousedown", handleClickAway);
-  }, []);
+    document.addEventListener("mousedown", handleClickAway)
+    return () => document.removeEventListener("mousedown", handleClickAway)
+  }, [])
 
   // Function to collect all folder IDs
   const getAllFolderIds = (items: TreeViewItem[]): string[] => {
-    let ids: string[] = [];
+    let ids: string[] = []
     items.forEach((item) => {
       if (item.children) {
-        ids.push(item.id);
-        ids = [...ids, ...getAllFolderIds(item.children)];
+        ids.push(item.id)
+        ids = [...ids, ...getAllFolderIds(item.children)]
       }
-    });
-    return ids;
-  };
+    })
+    return ids
+  }
 
   const handleExpandAll = () => {
-    setExpandedIds(new Set(getAllFolderIds(data)));
-  };
+    setExpandedIds(new Set(getAllFolderIds(data)))
+  }
 
   const handleCollapseAll = () => {
-    setExpandedIds(new Set());
-  };
+    setExpandedIds(new Set())
+  }
 
   const handleToggleExpand = (id: string, isOpen: boolean) => {
-    const newExpandedIds = new Set(expandedIds);
+    const newExpandedIds = new Set(expandedIds)
     if (isOpen) {
-      newExpandedIds.add(id);
+      newExpandedIds.add(id)
     } else {
-      newExpandedIds.delete(id);
+      newExpandedIds.delete(id)
     }
-    setExpandedIds(newExpandedIds);
-  };
+    setExpandedIds(newExpandedIds)
+  }
 
   // Get selected items
   const getSelectedItems = useCallback((): TreeViewItem[] => {
-    const items: TreeViewItem[] = [];
+    const items: TreeViewItem[] = []
     const processItem = (item: TreeViewItem) => {
       if (selectedIds.has(item.id)) {
-        items.push(item);
+        items.push(item)
       }
-      item.children?.forEach(processItem);
-    };
-    data.forEach(processItem);
-    return items;
-  }, [selectedIds, data]);
+      item.children?.forEach(processItem)
+    }
+    data.forEach(processItem)
+    return items
+  }, [selectedIds, data])
 
   // Get selected items, filtering out parents if their children are selected
   const getEffectiveSelectedItems = useCallback((): TreeViewItem[] => {
-    const selectedItems = getSelectedItems();
+    const selectedItems = getSelectedItems()
 
     // Build a set of all selected IDs for quick lookup
-    const selectedIdsSet = new Set(selectedItems.map((item) => item.id));
+    const selectedIdsSet = new Set(selectedItems.map((item) => item.id))
 
     // Filter out parents whose children are also selected
     return selectedItems.filter((item) => {
       // If this item has no children, always include it
-      if (!item.children) return true;
+      if (!item.children) return true
 
       // Check if any children of this item are selected
       const hasSelectedChildren = item.children.some((child) =>
         selectedIdsSet.has(child.id)
-      );
+      )
 
       // Only include this item if none of its children are selected
-      return !hasSelectedChildren;
-    });
-  }, [getSelectedItems]);
+      return !hasSelectedChildren
+    })
+  }, [getSelectedItems])
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     // Only track on left click and not on buttons
-    if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+    if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return
 
-    setDragStartPosition({ x: e.clientX, y: e.clientY });
-  }, []);
+    setDragStartPosition({ x: e.clientX, y: e.clientY })
+  }, [])
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
       // Check if primary button is still held down
       if (!(e.buttons & 1)) {
-        setIsDragging(false);
-        setDragStart(null);
-        setDragStartPosition(null);
-        return;
+        setIsDragging(false)
+        setDragStart(null)
+        setDragStartPosition(null)
+        return
       }
 
       // If we haven't registered a potential drag start position, ignore
-      if (!dragStartPosition) return;
+      if (!dragStartPosition) return
 
       // Calculate distance moved
-      const deltaX = e.clientX - dragStartPosition.x;
-      const deltaY = e.clientY - dragStartPosition.y;
-      const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+      const deltaX = e.clientX - dragStartPosition.x
+      const deltaY = e.clientY - dragStartPosition.y
+      const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY)
 
       // If we haven't started dragging yet, check if we should start
       if (!isDragging) {
         if (distance > DRAG_THRESHOLD) {
-          setIsDragging(true);
-          setDragStart(dragStartPosition.y);
+          setIsDragging(true)
+          setDragStart(dragStartPosition.y)
 
           // Clear selection if not holding shift/ctrl
           if (!e.shiftKey && !e.ctrlKey) {
-            setSelectedIds(new Set());
-            lastSelectedId.current = null;
+            setSelectedIds(new Set())
+            lastSelectedId.current = null
           }
         }
-        return;
+        return
       }
 
       // Rest of the existing drag logic
-      if (!dragRef.current) return;
+      if (!dragRef.current) return
 
       const items = Array.from(
         dragRef.current.querySelectorAll("[data-tree-item]")
-      ) as HTMLElement[];
+      ) as HTMLElement[]
 
-      const startY = dragStart;
-      const currentY = e.clientY;
+      const startY = dragStart
+      const currentY = e.clientY
       const [selectionStart, selectionEnd] = [
         Math.min(startY || 0, currentY),
         Math.max(startY || 0, currentY),
-      ];
+      ]
 
       const newSelection = new Set(
         e.shiftKey || e.ctrlKey ? Array.from(selectedIds) : []
-      );
+      )
 
       items.forEach((item) => {
-        const rect = item.getBoundingClientRect();
-        const itemTop = rect.top;
-        const itemBottom = rect.top + rect.height;
+        const rect = item.getBoundingClientRect()
+        const itemTop = rect.top
+        const itemBottom = rect.top + rect.height
 
         if (itemBottom >= selectionStart && itemTop <= selectionEnd) {
-          const id = item.getAttribute("data-id");
+          const id = item.getAttribute("data-id")
           const isClosedFolder =
-            item.getAttribute("data-folder-closed") === "true";
-          const parentFolderClosed = item.closest(
-            '[data-folder-closed="true"]'
-          );
+            item.getAttribute("data-folder-closed") === "true"
+          const parentFolderClosed = item.closest('[data-folder-closed="true"]')
 
           if (id && (isClosedFolder || !parentFolderClosed)) {
-            newSelection.add(id);
+            newSelection.add(id)
           }
         }
-      });
+      })
 
-      setSelectedIds(newSelection);
-      setCurrentMousePos(e.clientY);
+      setSelectedIds(newSelection)
+      setCurrentMousePos(e.clientY)
     },
     [isDragging, dragStart, selectedIds, dragStartPosition]
-  );
+  )
 
   const handleMouseUp = useCallback(() => {
-    setIsDragging(false);
-    setDragStart(null);
-    setDragStartPosition(null);
-  }, []);
+    setIsDragging(false)
+    setDragStart(null)
+    setDragStartPosition(null)
+  }, [])
 
   // Add cleanup for mouse events
   useEffect(() => {
     if (isDragging) {
-      document.addEventListener("mouseup", handleMouseUp);
-      document.addEventListener("mouseleave", handleMouseUp);
+      document.addEventListener("mouseup", handleMouseUp)
+      document.addEventListener("mouseleave", handleMouseUp)
     }
     return () => {
-      document.removeEventListener("mouseup", handleMouseUp);
-      document.removeEventListener("mouseleave", handleMouseUp);
-    };
-  }, [isDragging, handleMouseUp]);
+      document.removeEventListener("mouseup", handleMouseUp)
+      document.removeEventListener("mouseleave", handleMouseUp)
+    }
+  }, [isDragging, handleMouseUp])
 
   // Call onSelectionChange when selection changes
   useEffect(() => {
     if (onSelectionChange) {
-      onSelectionChange(getSelectedItems());
+      onSelectionChange(getSelectedItems())
     }
-  }, [selectedIds, onSelectionChange, getSelectedItems]);
+  }, [selectedIds, onSelectionChange, getSelectedItems])
 
   return (
     <div className="flex gap-4">
@@ -881,8 +879,8 @@ export default function TreeView({
                 className="font-medium cursor-pointer flex items-center"
                 title="Clear selection"
                 onClick={() => {
-                  setSelectedIds(new Set());
-                  lastSelectedId.current = null;
+                  setSelectedIds(new Set())
+                  lastSelectedId.current = null
                 }}
               >
                 <X className="h-4 w-4 mr-2" />
@@ -895,12 +893,12 @@ export default function TreeView({
                     variant="ghost"
                     size="sm"
                     onClick={() => {
-                      const effectiveItems = getEffectiveSelectedItems();
+                      const effectiveItems = getEffectiveSelectedItems()
                       const processItem = (item: TreeViewItem) => {
-                        onCheckChange?.(item, true);
-                        item.children?.forEach(processItem);
-                      };
-                      effectiveItems.forEach(processItem);
+                        onCheckChange?.(item, true)
+                        item.children?.forEach(processItem)
+                      }
+                      effectiveItems.forEach(processItem)
                     }}
                     className="text-green-600 hover:text-green-700 hover:bg-green-50"
                   >
@@ -910,12 +908,12 @@ export default function TreeView({
                     variant="ghost"
                     size="sm"
                     onClick={() => {
-                      const effectiveItems = getEffectiveSelectedItems();
+                      const effectiveItems = getEffectiveSelectedItems()
                       const processItem = (item: TreeViewItem) => {
-                        onCheckChange?.(item, false);
-                        item.children?.forEach(processItem);
-                      };
-                      effectiveItems.forEach(processItem);
+                        onCheckChange?.(item, false)
+                        item.children?.forEach(processItem)
+                      }
+                      effectiveItems.forEach(processItem)
                     }}
                     className="text-red-600 hover:text-red-700 hover:bg-red-50"
                   >
@@ -1010,5 +1008,5 @@ export default function TreeView({
         </div>
       </div>
     </div>
-  );
+  )
 }
