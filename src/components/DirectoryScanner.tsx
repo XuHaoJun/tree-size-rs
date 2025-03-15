@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { RefObject, useEffect, useMemo, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import { listen, UnlistenFn } from "@tauri-apps/api/event"
 import { open } from "@tauri-apps/plugin-dialog"
@@ -8,6 +8,7 @@ import {
   AlignJustify,
   ChevronDown,
   ChevronRight,
+  File as FileIcon,
   Folder,
   FolderOpen,
   HelpCircle,
@@ -15,6 +16,12 @@ import {
   Percent,
   Settings,
 } from "lucide-react"
+import AutoSizer from "react-virtualized-auto-sizer"
+import {
+  FixedSizeList,
+  FixedSizeList as List,
+  ListChildComponentProps,
+} from "react-window"
 
 import { bytesToReadableSize, normalizePath } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -60,6 +67,12 @@ interface DirectoryScanResult {
   scan_time_ms: number
 }
 
+// New interface for flattened tree items
+interface FlattenedTreeItem extends EnhancedTreeViewItem {
+  shouldRender: boolean
+  nestingLevel: number
+}
+
 export function DirectoryScanner() {
   const [selectedPath, setSelectedPath] = useState<string>("")
   const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([])
@@ -73,6 +86,9 @@ export function DirectoryScanner() {
   const [totalFiles, setTotalFiles] = useState<number>(0)
   const [freeSpace, setFreeSpace] = useState<string>("N/A")
   const [scanTimeMs, setScanTimeMs] = useState<number>(0)
+
+  // Reference to the virtualized list for scrolling
+  const listRef = useRef<List>(null)
 
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
@@ -616,12 +632,13 @@ export function DirectoryScanner() {
       {/* Main content - Scrollable */}
       <div className="flex-grow flex flex-col overflow-hidden h-0">
         {treeData.length > 0 ? (
-          <div className="flex-grow overflow-auto h-0">
+          <div className="flex-grow overflow-hidden h-0">
             <TreeSizeView
               data={treeData}
               formatSize={formatSize}
               expandedItems={expandedItems}
               onToggleExpand={handleToggleExpand}
+              listRef={listRef as RefObject<FixedSizeList>}
             />
           </div>
         ) : (
@@ -662,18 +679,163 @@ export function DirectoryScanner() {
   )
 }
 
+// Flatten the tree for virtualization
+function flattenTree(
+  items: EnhancedTreeViewItem[],
+  expandedItems: Set<string>,
+  nestingLevel = 0
+): FlattenedTreeItem[] {
+  // Pre-allocate a single result array to avoid repeated concatenation
+  const result: FlattenedTreeItem[] = []
+
+  // Helper function to recursively add items to the result array
+  const addItemsToResult = (
+    items: EnhancedTreeViewItem[],
+    nestingLevel: number
+  ) => {
+    for (const item of items) {
+      // Add the current item
+      result.push({
+        ...item,
+        shouldRender: true,
+        nestingLevel,
+      })
+
+      // If this item is expanded and has children, process them too
+      if (
+        expandedItems.has(item.id) &&
+        item.children &&
+        item.children.length > 0
+      ) {
+        addItemsToResult(
+          item.children as EnhancedTreeViewItem[],
+          nestingLevel + 1
+        )
+      }
+    }
+  }
+
+  // Start the recursive process
+  addItemsToResult(items, nestingLevel)
+
+  return result
+}
+
 // Tree View component specifically designed for TreeSize
 function TreeSizeView({
   data,
   formatSize,
   expandedItems,
   onToggleExpand,
+  listRef,
 }: {
   data: EnhancedTreeViewItem[]
   formatSize: (size: number) => string
   expandedItems: Set<string>
   onToggleExpand: (itemId: string) => void
+  listRef?: React.RefObject<List>
 }) {
+  // Flatten the tree for virtualization
+  const flattenedItems = useMemo(
+    () => flattenTree(data, expandedItems),
+    [data, expandedItems]
+  )
+
+  // Row height for virtualization
+  const ROW_HEIGHT = 36 // Adjust based on your actual row height
+
+  // Render a row in the virtualized list
+  const Row = ({ index, style }: ListChildComponentProps) => {
+    const item = flattenedItems[index]
+    if (!item) return null
+
+    const isExpanded = expandedItems.has(item.id)
+    const isLoading = item.loading || false
+    const isSignificantSize = item.percentOfParent >= 20
+
+    return (
+      <div
+        style={style}
+        className="border-b hover:bg-muted/30 transition-colors"
+      >
+        <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] text-sm h-full">
+          {/* Expand/collapse button with proper indentation */}
+          <div
+            className="p-1 flex items-center justify-center cursor-pointer"
+            style={{ paddingLeft: `${item.nestingLevel * 16}px` }}
+            onClick={() => item.type === "directory" && onToggleExpand(item.id)}
+          >
+            {item.type === "directory" &&
+              (isLoading ? (
+                <LoaderIcon className="h-4 w-4 animate-spin" />
+              ) : isExpanded ? (
+                <ChevronDown className="h-4 w-4" />
+              ) : (
+                <ChevronRight className="h-4 w-4" />
+              ))}
+          </div>
+
+          <div className="p-2 flex items-center gap-1 truncate relative">
+            {/* Icon */}
+            <div className="flex-shrink-0">
+              {item.type === "directory" ? (
+                <Folder className="h-4 w-4 text-blue-500" />
+              ) : (
+                <FileIcon className="h-4 w-4 text-gray-500" />
+              )}
+            </div>
+
+            {/* Percentage background bar */}
+            <div
+              className="absolute left-7 top-0 bottom-0 bg-yellow-200 opacity-50 z-0"
+              style={{
+                width: `${Math.min(item.percentOfParent, 100)}%`,
+                backgroundColor:
+                  item.backgroundColor || "rgba(255, 215, 0, 0.4)",
+              }}
+            />
+
+            {/* File/folder name - bold if significant percentage */}
+            <span
+              className={`truncate z-10 relative ${
+                isSignificantSize ? "font-bold" : "font-normal"
+              }`}
+            >
+              {item.name}
+            </span>
+          </div>
+
+          {/* Always show size */}
+          <div className="p-2 text-right font-mono w-24">
+            {formatSize(item.sizeBytes)}
+          </div>
+
+          {/* Always show percent of parent */}
+          <div
+            className={`p-2 text-right font-mono w-24 ${
+              isSignificantSize ? "font-bold" : "font-normal"
+            }`}
+          >
+            {item.percentOfParent.toFixed(1)}%
+          </div>
+
+          {/* Files count */}
+          <div className="p-2 text-right font-mono w-16">
+            {item.fileCount.toLocaleString()}
+          </div>
+
+          {/* Folders count */}
+          <div className="p-2 text-right font-mono w-16">
+            {item.folderCount.toLocaleString()}
+          </div>
+
+          <div className="p-2 w-32">{item.lastModified}</div>
+          <div className="p-2 w-32">{item.owner}</div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="h-full flex flex-col">
       {/* Header - Sticky */}
@@ -688,158 +850,22 @@ function TreeSizeView({
         <div className="p-2 w-32">Owner</div>
       </div>
 
-      {/* Tree rows - Scrollable */}
-      <div className="flex-grow overflow-auto h-0">
-        {data.map((item) => (
-          <TreeSizeItem
-            key={item.id}
-            item={item}
-            formatSize={formatSize}
-            expanded={expandedItems.has(item.id)}
-            onToggleExpand={onToggleExpand}
-            expandedItems={expandedItems}
-          />
-        ))}
+      {/* Virtualized tree rows */}
+      <div className="flex-grow h-0">
+        <AutoSizer>
+          {({ height, width }) => (
+            <List
+              ref={listRef}
+              height={height}
+              width={width}
+              itemCount={flattenedItems.length}
+              itemSize={ROW_HEIGHT}
+            >
+              {Row}
+            </List>
+          )}
+        </AutoSizer>
       </div>
     </div>
-  )
-}
-
-// Individual tree item component
-function TreeSizeItem({
-  item,
-  formatSize,
-  expanded,
-  onToggleExpand,
-  expandedItems,
-}: {
-  item: EnhancedTreeViewItem
-  formatSize: (size: number) => string
-  expanded: boolean
-  onToggleExpand: (itemId: string) => void
-  expandedItems: Set<string>
-}) {
-  const toggleExpand = () => {
-    // Check if the item is a directory or has children
-    if (item.type === "directory") {
-      onToggleExpand(item.id)
-    }
-  }
-
-  const isSignificantSize = item.percentOfParent >= 20
-  const isLoading = item.loading || false
-
-  return (
-    <div>
-      {/* Main row */}
-      <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] text-sm border-b hover:bg-muted/30 transition-colors">
-        <div
-          className="p-1 flex items-center justify-center cursor-pointer"
-          onClick={toggleExpand}
-        >
-          {item.type === "directory" &&
-            (isLoading ? (
-              <LoaderIcon className="h-4 w-4 animate-spin" />
-            ) : expanded ? (
-              <ChevronDown className="h-4 w-4" />
-            ) : (
-              <ChevronRight className="h-4 w-4" />
-            ))}
-        </div>
-
-        <div className="p-2 flex items-center gap-1 truncate relative">
-          {/* Icon */}
-          <div className="flex-shrink-0">
-            {item.type === "directory" ? (
-              <Folder className="h-4 w-4 text-blue-500" />
-            ) : (
-              <FileIcon className="h-4 w-4 text-gray-500" />
-            )}
-          </div>
-
-          {/* Percentage background bar */}
-          <div
-            className="absolute left-7 top-0 bottom-0 bg-yellow-200 opacity-50 z-0"
-            style={{
-              width: `${Math.min(item.percentOfParent, 100)}%`,
-              backgroundColor: item.backgroundColor || "rgba(255, 215, 0, 0.4)",
-            }}
-          />
-
-          {/* File/folder name - bold if significant percentage */}
-          <span
-            className={`truncate z-10 relative ${
-              isSignificantSize ? "font-bold" : "font-normal"
-            }`}
-          >
-            {item.name}
-          </span>
-        </div>
-
-        {/* Always show size */}
-        <div className="p-2 text-right font-mono w-24">
-          {formatSize(item.sizeBytes)}
-        </div>
-
-        {/* Always show percent of parent */}
-        <div
-          className={`p-2 text-right font-mono w-24 ${
-            isSignificantSize ? "font-bold" : "font-normal"
-          }`}
-        >
-          {item.percentOfParent.toFixed(1)}%
-        </div>
-
-        {/* Files count */}
-        <div className="p-2 text-right font-mono w-16">
-          {item.fileCount.toLocaleString()}
-        </div>
-
-        {/* Folders count */}
-        <div className="p-2 text-right font-mono w-16">
-          {item.folderCount.toLocaleString()}
-        </div>
-
-        <div className="p-2 w-32">{item.lastModified}</div>
-        <div className="p-2 w-32">{item.owner}</div>
-      </div>
-
-      {/* Children */}
-      {expanded && item.children && (
-        <div className="pl-4">
-          {(item.children as EnhancedTreeViewItem[]).map((child) => (
-            <TreeSizeItem
-              key={child.id}
-              item={child}
-              formatSize={formatSize}
-              expanded={expandedItems.has(child.id)}
-              onToggleExpand={onToggleExpand}
-              expandedItems={expandedItems}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// File icon component
-function FileIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg
-      {...props}
-      xmlns="http://www.w3.org/2000/svg"
-      width="24"
-      height="24"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
-      <polyline points="14 2 14 8 20 8" />
-    </svg>
   )
 }
