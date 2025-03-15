@@ -1,150 +1,157 @@
-"use client";
+"use client"
 
-import { useState, useEffect } from "react";
-import { Button } from "@/components/ui/button";
-import { open } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { bytesToReadableSize, normalizePath } from "@/lib/utils";
-import { TreeViewItem as BaseTreeViewItem } from "@/components/tree-view";
+import { useEffect, useState } from "react"
+import { invoke } from "@tauri-apps/api/core"
+import { listen, UnlistenFn } from "@tauri-apps/api/event"
+import { open } from "@tauri-apps/plugin-dialog"
 import {
-  Folder,
-  Percent,
   AlignJustify,
-  ChevronRight,
   ChevronDown,
-  Settings,
-  HelpCircle,
+  ChevronRight,
+  Folder,
   FolderOpen,
-  LoaderIcon
-} from "lucide-react";
+  HelpCircle,
+  LoaderIcon,
+  Percent,
+  Settings,
+} from "lucide-react"
+
+import { bytesToReadableSize, normalizePath } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+} from "@/components/ui/tooltip"
+import { TreeViewItem as BaseTreeViewItem } from "@/components/tree-view"
 
 // Extend the TreeViewItem interface to include size data
 interface EnhancedTreeViewItem extends BaseTreeViewItem {
-  sizeBytes: number;
-  entryCount: number;
-  allocatedBytes: number;
-  fileCount: number;
-  folderCount: number;
-  percentOfParent: number;
-  lastModified: string;
-  owner: string;
-  depth: number;
-  backgroundColor?: string;
-  loading?: boolean; // Add loading state for lazy-loaded directories
-  loaded?: boolean;  // Track if directory contents have been loaded
+  sizeBytes: number
+  entryCount: number
+  allocatedBytes: number
+  fileCount: number
+  folderCount: number
+  percentOfParent: number
+  lastModified: string
+  owner: string
+  depth: number
+  backgroundColor?: string
+  loading?: boolean // Add loading state for lazy-loaded directories
+  loaded?: boolean // Track if directory contents have been loaded
 }
 
 interface FileSystemTreeNode {
-  path: string;
-  name: string;
-  size_bytes: number;
-  entry_count: number;
-  file_count: number;
-  directory_count: number;
-  percent_of_parent: number;
-  children: FileSystemTreeNode[];
+  path: string
+  name: string
+  size_bytes: number
+  entry_count: number
+  file_count: number
+  directory_count: number
+  percent_of_parent: number
+  children: FileSystemTreeNode[]
 }
 
 interface DirectoryScanResult {
-  root_path: string; 
-  tree: FileSystemTreeNode;
-  scan_time_ms: number;
+  root_path: string
+  tree: FileSystemTreeNode
+  scan_time_ms: number
 }
 
 export function DirectoryScanner() {
-  const [selectedPath, setSelectedPath] = useState<string>("");
-  const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([]);
-  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
-  const [scanning, setScanning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string>("")
+  const [treeData, setTreeData] = useState<EnhancedTreeViewItem[]>([])
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set())
+  const [scanning, setScanning] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [currentTab, setCurrentTab] = useState<
     "file" | "home" | "scan" | "view" | "options" | "help"
-  >("scan");
-  const [totalSize, setTotalSize] = useState<number>(0);
-  const [totalFiles, setTotalFiles] = useState<number>(0);
-  const [freeSpace, setFreeSpace] = useState<string>("N/A");
-  const [scanTimeMs, setScanTimeMs] = useState<number>(0);
+  >("scan")
+  const [totalSize, setTotalSize] = useState<number>(0)
+  const [totalFiles, setTotalFiles] = useState<number>(0)
+  const [freeSpace, setFreeSpace] = useState<string>("N/A")
+  const [scanTimeMs, setScanTimeMs] = useState<number>(0)
 
   // Format size based on selected unit
   const formatSize = (sizeInBytes: number): string => {
     // Auto formatting
-    return bytesToReadableSize(sizeInBytes);
-  };
+    return bytesToReadableSize(sizeInBytes)
+  }
 
   // Generate color based on percentage
   const getColorForPercentage = (): string => {
     // Using a single color (yellow) with fixed opacity
-    return "rgba(255, 215, 0, 0.4)"; // Gold color with fixed opacity
-  };
+    return "rgba(255, 215, 0, 0.4)" // Gold color with fixed opacity
+  }
 
   // Apply full-height style to ensure proper layout in all browsers
   useEffect(() => {
-    const appRoot = document.getElementById('root');
+    const appRoot = document.getElementById("root")
     if (appRoot) {
-      appRoot.style.height = '100vh';
-      appRoot.style.display = 'flex';
-      appRoot.style.flexDirection = 'column';
-      appRoot.style.overflow = 'hidden';
+      appRoot.style.height = "100vh"
+      appRoot.style.display = "flex"
+      appRoot.style.flexDirection = "column"
+      appRoot.style.overflow = "hidden"
     }
     return () => {
       if (appRoot) {
-        appRoot.style.height = '';
-        appRoot.style.display = '';
-        appRoot.style.flexDirection = '';
-        appRoot.style.overflow = '';
+        appRoot.style.height = ""
+        appRoot.style.display = ""
+        appRoot.style.flexDirection = ""
+        appRoot.style.overflow = ""
       }
-    };
-  }, []);
+    }
+  }, [])
 
   // Handle window resize
   useEffect(() => {
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
+    window.addEventListener("resize", handleResize)
+    return () => window.removeEventListener("resize", handleResize)
+  }, [])
 
   const handleResize = () => {
     // No specific resize handling needed for the new layout
-  };
+  }
 
   // Handle expanding a directory - fetch children if needed
   const handleToggleExpand = async (itemId: string) => {
     // Find the item in the tree
-    const findItem = (items: EnhancedTreeViewItem[]): EnhancedTreeViewItem | null => {
+    const findItem = (
+      items: EnhancedTreeViewItem[]
+    ): EnhancedTreeViewItem | null => {
       for (const item of items) {
         if (item.id === itemId) {
-          return item;
+          return item
         }
-        const children = item.children as EnhancedTreeViewItem[] | undefined;
+        const children = item.children as EnhancedTreeViewItem[] | undefined
         if (children && children.length > 0) {
-          const found = findItem(children);
+          const found = findItem(children)
           if (found) {
-            return found;
+            return found
           }
         }
       }
-      return null;
-    };
+      return null
+    }
 
     // Toggle the expanded state
     setExpandedItems((prev) => {
-      const newSet = new Set(prev);
+      const newSet = new Set(prev)
       if (newSet.has(itemId)) {
-        newSet.delete(itemId);
-        return newSet;
+        newSet.delete(itemId)
+        return newSet
       } else {
-        newSet.add(itemId);
-        
+        newSet.add(itemId)
+
         // Check if we need to load children
-        const item = findItem(treeData);
-        if (item && item.type === "directory" && (!item.loaded || (item.children && item.children.length === 0))) {
+        const item = findItem(treeData)
+        if (
+          item &&
+          item.type === "directory" &&
+          (!item.loaded || (item.children && item.children.length === 0))
+        ) {
           // Set loading state for this directory
           const updateLoadingState = (
             items: EnhancedTreeViewItem[],
@@ -156,7 +163,7 @@ export function DirectoryScanner() {
                 return {
                   ...item,
                   loading: isLoading,
-                };
+                }
               } else if (item.children) {
                 return {
                   ...item,
@@ -165,29 +172,31 @@ export function DirectoryScanner() {
                     dirId,
                     isLoading
                   ),
-                };
+                }
               }
-              return item;
-            });
-          };
-          
+              return item
+            })
+          }
+
           // Update loading state in the tree
-          setTreeData((prevData) => updateLoadingState(prevData, itemId, true));
-          
+          setTreeData((prevData) => updateLoadingState(prevData, itemId, true))
+
           // Load children asynchronously
           loadDirectoryChildren(itemId).catch((err) => {
-            console.error("Error loading directory children:", err);
-            setError(`Failed to load directory contents: ${err}`);
-            
+            console.error("Error loading directory children:", err)
+            setError(`Failed to load directory contents: ${err}`)
+
             // Update loading state in the tree (set to false)
-            setTreeData((prevData) => updateLoadingState(prevData, itemId, false));
-          });
+            setTreeData((prevData) =>
+              updateLoadingState(prevData, itemId, false)
+            )
+          })
         }
-        
-        return newSet;
+
+        return newSet
       }
-    });
-  };
+    })
+  }
 
   // Function to load directory children from Tauri
   const loadDirectoryChildren = async (directoryId: string) => {
@@ -205,44 +214,44 @@ export function DirectoryScanner() {
               children: newChildren,
               loaded: true,
               loading: false,
-            };
+            }
           } else if (item.children) {
-            const children = item.children as EnhancedTreeViewItem[];
+            const children = item.children as EnhancedTreeViewItem[]
             return {
               ...item,
-              children: updateTreeWithChildren(
-                children,
-                dirId,
-                newChildren
-              ),
-            };
+              children: updateTreeWithChildren(children, dirId, newChildren),
+            }
           }
-          return item;
-        });
-      };
+          return item
+        })
+      }
 
       // Call Tauri to get directory children
-      const result = await invoke<FileSystemTreeNode>("get_directory_children", {
-        path: directoryId,
-      });
+      const result = await invoke<FileSystemTreeNode>(
+        "get_directory_children",
+        {
+          path: directoryId,
+        }
+      )
 
       // Convert children to our tree format
-      const children = result.children.map((child) =>
-        convertTreeNodeToTreeViewItem(child, 1) // Set depth to 1
-      );
+      const children = result.children.map(
+        (child) => convertTreeNodeToTreeViewItem(child, 1) // Set depth to 1
+      )
 
       // Update tree data with new children
-      setTreeData((prevData) => updateTreeWithChildren(prevData, directoryId, children));
-
+      setTreeData((prevData) =>
+        updateTreeWithChildren(prevData, directoryId, children)
+      )
     } catch (err) {
-      console.error("Error loading directory children:", err);
-      
+      console.error("Error loading directory children:", err)
+
       // Check if the error is related to missing cache
       if (String(err).includes("No scan data available")) {
         // If scan data is missing but we have a selected path, try to rescan
         if (selectedPath) {
-          setError("Cache data unavailable. Rescanning directory...");
-          
+          setError("Cache data unavailable. Rescanning directory...")
+
           // Reset loading state for the directory that failed
           const updateLoadingState = (
             items: EnhancedTreeViewItem[],
@@ -254,7 +263,7 @@ export function DirectoryScanner() {
                 return {
                   ...item,
                   loading: isLoading,
-                };
+                }
               } else if (item.children) {
                 return {
                   ...item,
@@ -263,27 +272,29 @@ export function DirectoryScanner() {
                     dirId,
                     isLoading
                   ),
-                };
+                }
               }
-              return item;
-            });
-          };
-          
+              return item
+            })
+          }
+
           // Update loading state in the tree (set to false)
-          setTreeData((prevData) => updateLoadingState(prevData, directoryId, false));
-          
+          setTreeData((prevData) =>
+            updateLoadingState(prevData, directoryId, false)
+          )
+
           // Attempt to rescan
           try {
-            await startScan();
+            await startScan()
           } catch (scanErr) {
-            setError(`Failed to rescan: ${scanErr}`);
+            setError(`Failed to rescan: ${scanErr}`)
           }
         }
       }
-      
-      throw err;
+
+      throw err
     }
-  };
+  }
 
   // Convert the Rust tree to our enhanced tree view format
   const convertTreeNodeToTreeViewItem = (
@@ -304,12 +315,12 @@ export function DirectoryScanner() {
       owner: "Unknown",
       depth,
       backgroundColor: getColorForPercentage(),
-      children: node.children.map(child => 
+      children: node.children.map((child) =>
         convertTreeNodeToTreeViewItem(child, depth + 1)
       ),
       loaded: node.children.length > 0, // Track if children are already loaded
-    };
-  };
+    }
+  }
 
   const selectDirectory = async () => {
     try {
@@ -318,153 +329,156 @@ export function DirectoryScanner() {
         directory: true,
         multiple: false,
         title: "Select Directory to Scan",
-      });
+      })
 
       if (selected && !Array.isArray(selected)) {
         // If we're changing directories, clear the cache first
         if (selectedPath && selectedPath !== selected) {
           try {
-            await invoke("clear_scan_cache");
+            await invoke("clear_scan_cache")
           } catch (err) {
-            console.error("Failed to clear scan cache:", err);
+            console.error("Failed to clear scan cache:", err)
             // Continue anyway
           }
         }
-        
-        setSelectedPath(selected);
-        
+
+        setSelectedPath(selected)
+
         // Reset any previous scan data when selecting a new directory
-        setTreeData([]);
-        setError(null);
+        setTreeData([])
+        setError(null)
       }
     } catch (err) {
-      console.error("Error selecting directory:", err);
-      setError("Failed to select directory");
+      console.error("Error selecting directory:", err)
+      setError("Failed to select directory")
     }
-  };
+  }
 
   // Set up event listener for scan result event
   useEffect(() => {
-    let unlistenResult: Promise<UnlistenFn>;
-    let unlistenComplete: Promise<UnlistenFn>;
+    let unlistenResult: Promise<UnlistenFn>
+    let unlistenComplete: Promise<UnlistenFn>
 
     const setupListeners = async () => {
       // Clean up any existing listeners first
       try {
         const cleanupListeners = async () => {
           try {
-            const dummyFn = await listen("dummy-event", () => {});
-            dummyFn();
+            const dummyFn = await listen("dummy-event", () => {})
+            dummyFn()
           } catch {
             // Ignore errors
           }
-        };
+        }
 
-        await cleanupListeners();
+        await cleanupListeners()
       } catch {
         // Ignore cleanup errors
       }
 
       // Listen for the complete scan result
       unlistenResult = listen<DirectoryScanResult>("scan-result", (event) => {
-        const result = event.payload as DirectoryScanResult;
-        
-        console.log("Received scan result:", result);
-        
+        const result = event.payload as DirectoryScanResult
+
+        console.log("Received scan result:", result)
+
         // Set scan time
-        setScanTimeMs(result.scan_time_ms);
-        
+        setScanTimeMs(result.scan_time_ms)
+
         // Calculate total size and files
         if (result.tree) {
-          setTotalSize(result.tree.size_bytes);
-          setTotalFiles(result.tree.file_count);
-          
+          setTotalSize(result.tree.size_bytes)
+          setTotalFiles(result.tree.file_count)
+
           // Convert tree to our format
-          const convertedTree = [convertTreeNodeToTreeViewItem(result.tree)];
-          setTreeData(convertedTree);
-          
+          const convertedTree = [convertTreeNodeToTreeViewItem(result.tree)]
+          setTreeData(convertedTree)
+
           // No smart expand - only expand the root by default
-          const newExpandedSet = new Set<string>([result.tree.path]);
-          setExpandedItems(newExpandedSet);
+          const newExpandedSet = new Set<string>([result.tree.path])
+          setExpandedItems(newExpandedSet)
         }
-        
+
         // Set scanning to false
-        setScanning(false);
-      });
+        setScanning(false)
+      })
 
       // Also listen for scan-complete for backward compatibility
       unlistenComplete = listen("scan-complete", () => {
-        setScanning(false);
-        
+        setScanning(false)
+
         // Check free space
         if (selectedPath) {
           try {
             invoke("get_free_space", { path: selectedPath })
               .then((freeSpaceResult: unknown) => {
-                setFreeSpace(bytesToReadableSize(freeSpaceResult as number));
+                setFreeSpace(bytesToReadableSize(freeSpaceResult as number))
               })
               .catch((err) => {
-                console.error("Error getting free space:", err);
-              });
+                console.error("Error getting free space:", err)
+              })
           } catch (err) {
-            console.error("Error getting free space:", err);
+            console.error("Error getting free space:", err)
           }
         }
-      });
-    };
+      })
+    }
 
     if (selectedPath) {
-      setupListeners();
+      setupListeners()
     }
 
     return () => {
       // Clean up listeners when component unmounts
       if (unlistenResult) {
-        unlistenResult.then((unlisten) => unlisten());
+        unlistenResult.then((unlisten) => unlisten())
       }
       if (unlistenComplete) {
-        unlistenComplete.then((unlisten) => unlisten());
+        unlistenComplete.then((unlisten) => unlisten())
       }
-    };
-  }, [selectedPath]);
+    }
+  }, [selectedPath])
 
   const startScan = async () => {
     if (!selectedPath) {
-      setError("Please select a directory first");
-      return;
+      setError("Please select a directory first")
+      return
     }
 
     try {
       // Clear state first
-      setError(null);
-      setTreeData([]);
-      setScanTimeMs(0);
-      setScanning(true);
+      setError(null)
+      setTreeData([])
+      setScanTimeMs(0)
+      setScanning(true)
 
       // Force a small delay to ensure any pending operations complete
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 50))
 
       // Invoke the Rust command to scan the directory
-      await invoke("scan_directory_size", { path: selectedPath });
+      await invoke("scan_directory_size", { path: selectedPath })
     } catch (err) {
-      console.error("Error scanning directory:", err);
-      setError(`Failed to scan directory: ${err}`);
-      setScanning(false);
+      console.error("Error scanning directory:", err)
+      setError(`Failed to scan directory: ${err}`)
+      setScanning(false)
     }
-  };
+  }
 
   // Add a cleanup effect to clear the cache when component unmounts
   useEffect(() => {
     return () => {
       // Attempt to clear the cache when the component unmounts
-      invoke("clear_scan_cache").catch(err => {
-        console.error("Failed to clear scan cache on unmount:", err);
-      });
-    };
-  }, []);
+      invoke("clear_scan_cache").catch((err) => {
+        console.error("Failed to clear scan cache on unmount:", err)
+      })
+    }
+  }, [])
 
   return (
-    <div className="h-full w-full flex flex-col overflow-hidden" style={{ height: '100vh', maxHeight: '100vh' }}>
+    <div
+      className="h-full w-full flex flex-col overflow-hidden"
+      style={{ height: "100vh", maxHeight: "100vh" }}
+    >
       {/* Toolbar - Fixed at top */}
       <div className="border-b bg-muted/40 flex-shrink-0 z-20">
         <Tabs
@@ -587,7 +601,9 @@ export function DirectoryScanner() {
 
       {/* Path display - Fixed below toolbar */}
       {selectedPath && (
-        <div className="p-2 text-sm bg-muted/20 border-b flex-shrink-0 z-10">{normalizePath(selectedPath)}</div>
+        <div className="p-2 text-sm bg-muted/20 border-b flex-shrink-0 z-10">
+          {normalizePath(selectedPath)}
+        </div>
       )}
 
       {/* Error display - Fixed below path display if there's an error */}
@@ -636,13 +652,14 @@ export function DirectoryScanner() {
           {!scanning && treeData.length > 0 && (
             <span>
               {totalFiles.toLocaleString()} items, {formatSize(totalSize)}
-              {scanTimeMs > 0 && ` (scanned in ${(scanTimeMs / 1000).toFixed(2)}s)`}
+              {scanTimeMs > 0 &&
+                ` (scanned in ${(scanTimeMs / 1000).toFixed(2)}s)`}
             </span>
           )}
         </div>
       </div>
     </div>
-  );
+  )
 }
 
 // Tree View component specifically designed for TreeSize
@@ -652,10 +669,10 @@ function TreeSizeView({
   expandedItems,
   onToggleExpand,
 }: {
-  data: EnhancedTreeViewItem[];
-  formatSize: (size: number) => string;
-  expandedItems: Set<string>;
-  onToggleExpand: (itemId: string) => void;
+  data: EnhancedTreeViewItem[]
+  formatSize: (size: number) => string
+  expandedItems: Set<string>
+  onToggleExpand: (itemId: string) => void
 }) {
   return (
     <div className="h-full flex flex-col">
@@ -685,7 +702,7 @@ function TreeSizeView({
         ))}
       </div>
     </div>
-  );
+  )
 }
 
 // Individual tree item component
@@ -696,21 +713,21 @@ function TreeSizeItem({
   onToggleExpand,
   expandedItems,
 }: {
-  item: EnhancedTreeViewItem;
-  formatSize: (size: number) => string;
-  expanded: boolean;
-  onToggleExpand: (itemId: string) => void;
-  expandedItems: Set<string>;
+  item: EnhancedTreeViewItem
+  formatSize: (size: number) => string
+  expanded: boolean
+  onToggleExpand: (itemId: string) => void
+  expandedItems: Set<string>
 }) {
   const toggleExpand = () => {
     // Check if the item is a directory or has children
     if (item.type === "directory") {
-      onToggleExpand(item.id);
+      onToggleExpand(item.id)
     }
-  };
+  }
 
-  const isSignificantSize = item.percentOfParent >= 20;
-  const isLoading = item.loading || false;
+  const isSignificantSize = item.percentOfParent >= 20
+  const isLoading = item.loading || false
 
   return (
     <div>
@@ -803,7 +820,7 @@ function TreeSizeItem({
         </div>
       )}
     </div>
-  );
+  )
 }
 
 // File icon component
@@ -824,5 +841,5 @@ function FileIcon(props: React.SVGProps<SVGSVGElement>) {
       <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
       <polyline points="14 2 14 8 20 8" />
     </svg>
-  );
+  )
 }
