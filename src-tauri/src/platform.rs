@@ -16,7 +16,9 @@ type FileTime = (i64, i64, i64);
 /// Represents complete information about a filesystem path
 pub struct PathInfo {
   /// Size in bytes
-  pub size: u64,
+  pub size_bytes: u64,
+  // Size in bytes on disk
+  pub size_allocated_bytes: u64,
   /// Inode and device information for detecting cycles (Unix) or file/volume ID (Windows)
   pub inode_device: Option<(u64, u64)>,
   /// File modification/access/creation times
@@ -31,13 +33,12 @@ pub struct PathInfo {
 /// Get complete path information in a platform-agnostic way
 pub fn get_path_info<P: AsRef<Path>>(
   path: P,
-  use_apparent_size: bool,
   follow_links: bool,
 ) -> Option<PathInfo> {
   let path_ref = path.as_ref();
 
   // First get the metadata
-  let (size, inode_device, times) = get_metadata(path_ref, use_apparent_size, follow_links)?;
+  let (size_bytes, size_allocated_bytes, inode_device, times) = get_metadata(path_ref, follow_links)?;
 
   // Then determine if it's a directory
   let metadata = if follow_links {
@@ -50,7 +51,8 @@ pub fn get_path_info<P: AsRef<Path>>(
   let is_file = metadata.is_file();
 
   Some(PathInfo {
-    size,
+    size_bytes,
+    size_allocated_bytes,
     inode_device,
     times,
     is_dir,
@@ -61,9 +63,8 @@ pub fn get_path_info<P: AsRef<Path>>(
 #[cfg(target_family = "unix")]
 pub fn get_metadata<P: AsRef<Path>>(
   path: P,
-  use_apparent_size: bool,
   follow_links: bool,
-) -> Option<(u64, Option<InodeAndDevice>, FileTime)> {
+) -> Option<(u64, u64, Option<InodeAndDevice>, FileTime)> {
   use std::os::unix::fs::MetadataExt;
   let metadata = if follow_links {
     path.as_ref().metadata()
@@ -72,19 +73,17 @@ pub fn get_metadata<P: AsRef<Path>>(
   };
   match metadata {
     Ok(md) => {
-      if use_apparent_size {
-        Some((
-          md.len(),
-          Some((md.ino(), md.dev())),
-          (md.mtime(), md.atime(), md.ctime()),
-        ))
-      } else {
-        Some((
-          md.blocks() * get_block_size(),
-          Some((md.ino(), md.dev())),
-          (md.mtime(), md.atime(), md.ctime()),
-        ))
-      }
+      // Apparent size
+      let size = md.len();
+      // Allocated size
+      let size_allocated = md.blocks() * get_block_size();
+      
+      Some((
+        size,
+        size_allocated,
+        Some((md.ino(), md.dev())),
+        (md.mtime(), md.atime(), md.ctime()),
+      ))
     }
     Err(_e) => None,
   }
@@ -93,9 +92,8 @@ pub fn get_metadata<P: AsRef<Path>>(
 #[cfg(target_family = "windows")]
 pub fn get_metadata<P: AsRef<Path>>(
   path: P,
-  use_apparent_size: bool,
   follow_links: bool,
-) -> Option<(u64, Option<InodeAndDevice>, FileTime)> {
+) -> Option<(u64, u64, Option<InodeAndDevice>, FileTime)> {
   // On windows opening the file to get size, file ID and volume can be very
   // expensive because 1) it causes a few system calls, and more importantly 2) it can cause
   // windows defender to scan the file.
@@ -159,37 +157,27 @@ pub fn get_metadata<P: AsRef<Path>>(
     Ok(Handle::from_file(file))
   }
 
-  fn get_metadata_expensive(
-    path: &Path,
-    use_apparent_size: bool,
-  ) -> Option<(u64, Option<InodeAndDevice>, FileTime)> {
+  fn get_metadata_expensive(path: &Path) -> Option<(u64, u64, Option<InodeAndDevice>, FileTime)> {
     use winapi_util::file::information;
+    use filesize::PathExt;
 
     let h = handle_from_path_limited(path).ok()?;
     let info = information(&h).ok()?;
+    
+    // Get both sizes
+    let apparent_size = info.file_size();
+    let allocated_size = path.size_on_disk().unwrap_or(apparent_size);
 
-    if use_apparent_size {
-      use filesize::PathExt;
-      Some((
-        path.size_on_disk().ok()?,
-        Some((info.file_index(), info.volume_serial_number())),
-        (
-          info.last_write_time().unwrap() as i64,
-          info.last_access_time().unwrap() as i64,
-          info.creation_time().unwrap() as i64,
-        ),
-      ))
-    } else {
-      Some((
-        info.file_size(),
-        Some((info.file_index(), info.volume_serial_number())),
-        (
-          info.last_write_time().unwrap() as i64,
-          info.last_access_time().unwrap() as i64,
-          info.creation_time().unwrap() as i64,
-        ),
-      ))
-    }
+    Some((
+      apparent_size,
+      allocated_size,
+      Some((info.file_index(), info.volume_serial_number())),
+      (
+        info.last_write_time().unwrap() as i64,
+        info.last_access_time().unwrap() as i64,
+        info.creation_time().unwrap() as i64,
+      ),
+    ))
   }
 
   use std::os::windows::fs::MetadataExt;
@@ -225,10 +213,19 @@ pub fn get_metadata<P: AsRef<Path>>(
       if ((attr_filtered & FILE_ATTRIBUTE_ARCHIVE) != 0
         || (attr_filtered & FILE_ATTRIBUTE_DIRECTORY) != 0
         || md.file_attributes() == FILE_ATTRIBUTE_NORMAL)
-        && !((attr_filtered & IS_PROBABLY_ONEDRIVE != 0) && use_apparent_size)
+        && !(attr_filtered & IS_PROBABLY_ONEDRIVE != 0)
       {
+        // For normal files, we use the standard metadata
+        let apparent_size = md.len();
+        
+        // For simple files, apparent size is often the same as allocated size
+        // But we would need an expensive call to get the exact allocated size
+        // We'll just use apparent size for both in this simple case
+        let allocated_size = apparent_size;
+        
         Some((
-          md.len(),
+          apparent_size,
+          allocated_size,
           None,
           (
             md.last_write_time() as i64,
@@ -237,10 +234,11 @@ pub fn get_metadata<P: AsRef<Path>>(
           ),
         ))
       } else {
-        get_metadata_expensive(path, use_apparent_size)
+        // For special files (compressed, sparse, etc.), we need the expensive call
+        get_metadata_expensive(path)
       }
     }
-    _ => get_metadata_expensive(path, use_apparent_size),
+    _ => get_metadata_expensive(path),
   }
 }
 
@@ -253,7 +251,7 @@ pub fn get_space_info<P: AsRef<Path>>(path: P) -> Option<(u64, u64, u64)> {
   let path_ref = path.as_ref();
 
   // First, ensure the path exists
-  let metadata = get_path_info(path_ref, false, false)?;
+  let metadata = get_path_info(path_ref, false)?;
 
   // Get the canonical path
   let canonical_path = path_ref.canonicalize().ok()?;
