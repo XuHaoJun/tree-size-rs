@@ -24,21 +24,6 @@ struct AnalyticsInfo {
   directory_count: AtomicU64,
 }
 
-impl AnalyticsInfo {
-  #[allow(dead_code)]
-  fn new_with_size(size: u64, is_dir: bool) -> Self {
-    let file_count = if is_dir { 0 } else { 1 };
-    let directory_count = if is_dir { 1 } else { 0 };
-
-    Self {
-      size_bytes: AtomicU64::new(size),
-      entry_count: AtomicU64::new(1), // Count itself as 1 entry
-      file_count: AtomicU64::new(file_count),
-      directory_count: AtomicU64::new(directory_count),
-    }
-  }
-}
-
 /// Represents size information for a file or directory
 #[derive(Clone, Debug, Serialize)]
 struct FileSystemEntry {
@@ -86,36 +71,6 @@ struct DirectoryScanResult {
   scan_time_ms: u64,
 }
 
-// Get parent directories up to but not beyond the target directory
-fn get_parent_chain_sync(path: &Path, target_dir: Option<&Path>) -> Vec<PathBuf> {
-  let mut chain = Vec::with_capacity(10); // Pre-allocate for typical directory depth
-  let mut current = path;
-
-  while let Some(parent) = current.parent() {
-    // If we've reached the target directory, stop collecting parents
-    if let Some(target) = target_dir {
-      if !parent.starts_with(target) {
-        break;
-      }
-    }
-
-    chain.push(parent.to_path_buf());
-    current = parent;
-  }
-
-  chain
-}
-
-// Structure to hold updates that need to be applied to parent directories
-#[allow(dead_code)]
-struct ParentUpdate {
-  path: PathBuf,
-  size_bytes: u64,
-  entry_count: u64,
-  file_count: u64,
-  directory_count: u64,
-}
-
 // Efficient sync function that uses Rayon for parallel processing
 fn calculate_size_sync(
   path: PathBuf,
@@ -123,7 +78,6 @@ fn calculate_size_sync(
   target_dir_path: Option<PathBuf>,
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
-  parent_updates: Arc<Mutex<Vec<ParentUpdate>>>,
 ) -> std::io::Result<()> {
   // If we've already processed this path, skip it
   if !processed_paths.insert(path.clone()) {
@@ -153,12 +107,6 @@ fn calculate_size_sync(
     1
   } else {
     0
-  };
-
-  // Skip parent size calculation if this is the target directory
-  let is_target_dir = match &target_dir_path {
-    Some(target) => path == *target,
-    None => false,
   };
 
   // Add entry to analytics map with initial values (will be updated later for directories)
@@ -200,7 +148,6 @@ fn calculate_size_sync(
         target_dir_path.clone(),
         visited_inodes.clone(),
         processed_paths.clone(),
-        parent_updates.clone(),
       );
     });
 
@@ -261,96 +208,7 @@ fn calculate_size_sync(
       .store(total_dirs, Ordering::Relaxed);
   }
 
-  // Queue parent directory updates for batch processing after all calculations
-  if !is_target_dir {
-    // Use the final calculated size (which includes all children for directories)
-    let size = entry_analytics.size_bytes.load(Ordering::Relaxed);
-    let entries = entry_analytics.entry_count.load(Ordering::Relaxed);
-    let files = entry_analytics.file_count.load(Ordering::Relaxed);
-    let dirs = entry_analytics.directory_count.load(Ordering::Relaxed);
-
-    let parent_chain = get_parent_chain_sync(&path, target_dir_path.as_deref());
-
-    // Add all parent updates to the queue
-    let mut update_queue = parent_updates.lock().unwrap();
-    for parent in parent_chain {
-      update_queue.push(ParentUpdate {
-        path: parent,
-        size_bytes: size,
-        entry_count: entries,
-        file_count: files,
-        directory_count: dirs,
-      });
-    }
-  }
-
   Ok(())
-}
-
-// Mark as #[allow(dead_code)] since it's kept for API compatibility
-#[allow(dead_code)]
-async fn calculate_size_async(
-  path: PathBuf,
-  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
-  target_dir_path: Option<PathBuf>,
-  visited_inodes: Option<Arc<DashSet<(u64, u64)>>>, // Track device and inode pairs
-  processed_paths: Option<Arc<DashSet<PathBuf>>>,   // Track paths we've already processed
-) -> std::io::Result<()> {
-  // Use shared tracking sets
-  let visited = visited_inodes.unwrap_or_else(|| Arc::new(DashSet::new()));
-  let processed = processed_paths.unwrap_or_else(|| Arc::new(DashSet::new()));
-
-  // Create a queue for parent updates
-  let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000))); // Pre-allocate for efficiency
-
-  // Process the directory synchronously with Rayon parallelism
-  let result = calculate_size_sync(
-    path,
-    analytics_map.clone(),
-    target_dir_path,
-    visited,
-    processed,
-    parent_updates.clone(),
-  );
-
-  // Apply all parent updates in batch
-  let updates = parent_updates.lock().unwrap();
-
-  // Group updates by parent path for efficiency
-  let mut grouped_updates: HashMap<PathBuf, (u64, u64, u64, u64)> = HashMap::new();
-  for update in updates.iter() {
-    let entry = grouped_updates
-      .entry(update.path.clone())
-      .or_insert((0, 0, 0, 0));
-    entry.0 += update.size_bytes;
-    entry.1 += update.entry_count;
-    entry.2 += update.file_count;
-    entry.3 += update.directory_count;
-  }
-
-  // Apply the grouped updates
-  for (parent_path, (size, entries, files, dirs)) in grouped_updates {
-    match analytics_map.entry(parent_path.clone()) {
-      dashmap::mapref::entry::Entry::Occupied(e) => {
-        let analytics = e.get();
-        analytics.size_bytes.fetch_add(size, Ordering::Relaxed);
-        analytics.entry_count.fetch_add(entries, Ordering::Relaxed);
-        analytics.file_count.fetch_add(files, Ordering::Relaxed);
-        analytics.directory_count.fetch_add(dirs, Ordering::Relaxed);
-      }
-      dashmap::mapref::entry::Entry::Vacant(e) => {
-        let analytics = Arc::new(AnalyticsInfo {
-          size_bytes: AtomicU64::new(size),
-          entry_count: AtomicU64::new(entries),
-          file_count: AtomicU64::new(files),
-          directory_count: AtomicU64::new(dirs + 1), // +1 because parent is a directory
-        });
-        e.insert(analytics);
-      }
-    }
-  }
-
-  result
 }
 
 // This function converts the analytics map to a vector of FileSystemEntry objects
@@ -629,9 +487,6 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
   let analytics_map_clone = analytics_map.clone();
   let target_dir_clone = target_dir.clone();
   let scan_task = tokio::task::spawn_blocking(move || {
-    // Create parent updates collection
-    let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000)));
-
     // Run the synchronous calculation using Rayon's parallel processing
     calculate_size_sync(
       target_dir_clone.clone(),
@@ -639,7 +494,6 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
       Some(target_dir_clone.clone()),
       visited_inodes,
       processed_paths,
-      parent_updates,
     )
   });
 
@@ -733,7 +587,7 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
         .into_iter()
         .for_each(|(parent_path, mut indices)| {
           // Sort indices by size (largest first) - this can be done in parallel for each entry
-          indices.par_sort_by(|&a, &b| {
+          indices.par_sort_unstable_by(|&a, &b| {
             let size_a = entries_for_indices[a].size_bytes;
             let size_b = entries_for_indices[b].size_bytes;
             size_b.cmp(&size_a) // Sort largest first
@@ -893,7 +747,6 @@ mod tests {
     let analytics_map = Arc::new(DashMap::new());
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
-    let parent_updates = Arc::new(Mutex::new(Vec::new()));
 
     // Run the function
     calculate_size_sync(
@@ -902,7 +755,6 @@ mod tests {
       None, // No target directory
       visited_inodes,
       processed_paths,
-      parent_updates,
     )?;
 
     // Verify the results
@@ -961,7 +813,6 @@ mod tests {
     let analytics_map = Arc::new(DashMap::new());
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
-    let parent_updates = Arc::new(Mutex::new(Vec::new()));
 
     // Run the function
     calculate_size_sync(
@@ -970,7 +821,6 @@ mod tests {
       None,
       visited_inodes,
       processed_paths,
-      parent_updates,
     )?;
 
     // Verify the results
@@ -1029,7 +879,6 @@ mod tests {
     let analytics_map = Arc::new(DashMap::new());
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
-    let parent_updates = Arc::new(Mutex::new(Vec::new()));
 
     // Run the function
     calculate_size_sync(
@@ -1038,7 +887,6 @@ mod tests {
       None,
       visited_inodes,
       processed_paths,
-      parent_updates,
     )?;
 
     // Verify the results for the root directory
@@ -1120,7 +968,6 @@ mod tests {
     let analytics_map = Arc::new(DashMap::new());
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
-    let parent_updates = Arc::new(Mutex::new(Vec::new()));
 
     // Run the function
     calculate_size_sync(
@@ -1129,7 +976,6 @@ mod tests {
       None,
       visited_inodes,
       processed_paths,
-      parent_updates,
     )?;
 
     // Verify the results
@@ -1174,7 +1020,6 @@ mod tests {
       let analytics_map = Arc::new(DashMap::new());
       let visited_inodes = Arc::new(DashSet::new());
       let processed_paths = Arc::new(DashSet::new());
-      let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000)));
 
       // Use Rayon's default thread pool (parallel)
       calculate_size_sync(
@@ -1183,7 +1028,6 @@ mod tests {
         None,
         visited_inodes,
         processed_paths,
-        parent_updates,
       )?;
 
       println!("Parallel scan found {} entries", analytics_map.len());
@@ -1197,7 +1041,6 @@ mod tests {
       let analytics_map = Arc::new(DashMap::new());
       let visited_inodes = Arc::new(DashSet::new());
       let processed_paths = Arc::new(DashSet::new());
-      let parent_updates = Arc::new(Mutex::new(Vec::with_capacity(1000)));
 
       // Create a single-threaded pool to simulate sequential processing
       let pool = rayon::ThreadPoolBuilder::new()
@@ -1212,7 +1055,6 @@ mod tests {
           None,
           visited_inodes,
           processed_paths,
-          parent_updates,
         );
       });
 
