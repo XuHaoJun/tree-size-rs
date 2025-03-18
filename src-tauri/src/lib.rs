@@ -24,6 +24,8 @@ struct AnalyticsInfo {
   file_count: AtomicU64,
   /// Number of directories
   directory_count: AtomicU64,
+  /// Last modified time (Unix timestamp in seconds)
+  last_modified_time: AtomicU64,
 }
 
 /// Represents size information for a file or directory
@@ -41,6 +43,8 @@ struct FileSystemEntry {
   file_count: u64,
   /// Number of directories
   directory_count: u64,
+  /// last modified time
+  last_modified_time: u64,
 }
 
 /// Represents a node in the file system tree
@@ -62,6 +66,8 @@ struct FileSystemTreeNode {
   directory_count: u64,
   /// Percentage of parent size (0-100)
   percent_of_parent: f64,
+  /// Last modified time (Unix timestamp in seconds)
+  last_modified_time: u64,
   /// Child nodes
   children: Vec<FileSystemTreeNode>,
 }
@@ -125,6 +131,7 @@ fn calculate_size_sync(
         entry_count: AtomicU64::new(entry_count),
         file_count: AtomicU64::new(file_count),
         directory_count: AtomicU64::new(directory_count),
+        last_modified_time: AtomicU64::new(path_info.times.0 as u64),
       });
       e.insert(analytics.clone());
       analytics
@@ -240,6 +247,7 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         entry_count: analytics.entry_count.load(Ordering::Relaxed),
         file_count: analytics.file_count.load(Ordering::Relaxed),
         directory_count: analytics.directory_count.load(Ordering::Relaxed),
+        last_modified_time: analytics.last_modified_time.load(Ordering::Relaxed) as u64,
       }
     })
     .collect()
@@ -342,6 +350,7 @@ fn build_tree_from_entries_with_depth(
       file_count: entry.file_count,
       directory_count: entry.directory_count,
       percent_of_parent: 100.0, // Default value, will be updated by parent
+      last_modified_time: entry.last_modified_time,
       children,
     }
   }
@@ -415,6 +424,7 @@ fn build_tree_from_indices(
             } else {
               0.0
             },
+            last_modified_time: child_entry.last_modified_time,
             children: Vec::new(), // No need to build children of children here
           };
 
@@ -434,6 +444,7 @@ fn build_tree_from_indices(
       file_count: entry.file_count,
       directory_count: entry.directory_count,
       percent_of_parent: 100.0, // Default value, will be updated by parent
+      last_modified_time: entry.last_modified_time,
       children,
     }
   }
