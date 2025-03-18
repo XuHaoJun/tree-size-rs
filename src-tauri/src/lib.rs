@@ -16,6 +16,8 @@ use tauri::Emitter;
 struct AnalyticsInfo {
   /// Total size in bytes
   size_bytes: AtomicU64,
+  /// Total size in bytes on disk
+  size_allocated_bytes: AtomicU64,
   /// Total number of entries (files and directories)
   entry_count: AtomicU64,
   /// Number of files
@@ -31,6 +33,8 @@ struct FileSystemEntry {
   path: PathBuf,
   /// Size in bytes
   size_bytes: u64,
+  /// Size allocated on disk in bytes
+  size_allocated_bytes: u64,
   /// Number of entries (files and directories)
   entry_count: u64,
   /// Number of files
@@ -48,6 +52,8 @@ struct FileSystemTreeNode {
   name: String,
   /// Size in bytes
   size_bytes: u64,
+  /// Size allocated on disk in bytes
+  size_allocated_bytes: u64,
   /// Number of entries (files and directories)
   entry_count: u64,
   /// Number of files
@@ -86,7 +92,7 @@ fn calculate_size_sync(
 
   // Get path info using our platform-agnostic function - will work for files, dirs and symlinks
   let is_symlink = path.is_symlink();
-  let path_info = match platform::get_path_info(&path, true, is_symlink) {
+  let path_info = match platform::get_path_info(&path, is_symlink) {
     Some(info) => info,
     None => return Ok(()),
   };
@@ -114,7 +120,8 @@ fn calculate_size_sync(
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
-        size_bytes: AtomicU64::new(path_info.size),
+        size_bytes: AtomicU64::new(path_info.size_bytes),
+        size_allocated_bytes: AtomicU64::new(path_info.size_allocated_bytes),
         entry_count: AtomicU64::new(entry_count),
         file_count: AtomicU64::new(file_count),
         directory_count: AtomicU64::new(directory_count),
@@ -152,8 +159,10 @@ fn calculate_size_sync(
     });
 
     // Now compute the total size based on children
-    let dir_own_size = path_info.size; // Start with directory's own size
+    let dir_own_size = path_info.size_bytes; // Start with directory's own size
+    let dir_own_allocated_size = path_info.size_allocated_bytes; // Start with directory's own allocated size
     let mut total_size = dir_own_size;
+    let mut total_allocated_size = dir_own_allocated_size;
     let mut total_entries = 1; // Start with the directory itself
     let mut total_files = 0; // Directories don't count as files
     let mut total_dirs = 1; // Count this directory
@@ -172,11 +181,13 @@ fn calculate_size_sync(
       // Get analytics info for the child if it exists
       if let Some(child_analytics) = analytics_map.get(child_path) {
         let child_size = child_analytics.size_bytes.load(Ordering::Relaxed);
+        let child_allocated_size = child_analytics.size_allocated_bytes.load(Ordering::Relaxed);
         let child_entries = child_analytics.entry_count.load(Ordering::Relaxed);
         let child_files = child_analytics.file_count.load(Ordering::Relaxed);
         let child_dirs = child_analytics.directory_count.load(Ordering::Relaxed);
 
         total_size += child_size;
+        total_allocated_size += child_allocated_size;
 
         // For symlinks, count the entry but not as file/dir
         if child_path.is_symlink() {
@@ -197,6 +208,9 @@ fn calculate_size_sync(
     entry_analytics
       .size_bytes
       .store(total_size, Ordering::Relaxed);
+    entry_analytics
+      .size_allocated_bytes
+      .store(total_allocated_size, Ordering::Relaxed);
     entry_analytics
       .entry_count
       .store(total_entries, Ordering::Relaxed);
@@ -222,6 +236,7 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
       FileSystemEntry {
         path: path.clone(),
         size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
+        size_allocated_bytes: analytics.size_allocated_bytes.load(Ordering::Relaxed),
         entry_count: analytics.entry_count.load(Ordering::Relaxed),
         file_count: analytics.file_count.load(Ordering::Relaxed),
         directory_count: analytics.directory_count.load(Ordering::Relaxed),
@@ -322,6 +337,7 @@ fn build_tree_from_entries_with_depth(
       path: entry.path.clone(),
       name,
       size_bytes: entry.size_bytes,
+      size_allocated_bytes: entry.size_allocated_bytes,
       entry_count: entry.entry_count,
       file_count: entry.file_count,
       directory_count: entry.directory_count,
@@ -390,6 +406,7 @@ fn build_tree_from_indices(
               .unwrap_or("unknown")
               .to_string(),
             size_bytes: child_entry.size_bytes,
+            size_allocated_bytes: child_entry.size_allocated_bytes,
             entry_count: child_entry.entry_count,
             file_count: child_entry.file_count,
             directory_count: child_entry.directory_count,
@@ -412,6 +429,7 @@ fn build_tree_from_indices(
       path: entry.path.clone(),
       name,
       size_bytes: entry.size_bytes,
+      size_allocated_bytes: entry.size_allocated_bytes,
       entry_count: entry.entry_count,
       file_count: entry.file_count,
       directory_count: entry.directory_count,

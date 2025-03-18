@@ -54,6 +54,7 @@ interface FileSystemTreeNode {
   path: string
   name: string
   size_bytes: number
+  size_allocated_bytes: number
   entry_count: number
   file_count: number
   directory_count: number
@@ -323,7 +324,7 @@ export function DirectoryScanner() {
       type: node.directory_count > 0 ? "directory" : "file",
       sizeBytes: node.size_bytes,
       entryCount: node.entry_count,
-      allocatedBytes: node.size_bytes, // Use size_bytes as allocatedBytes
+      allocatedBytes: node.size_allocated_bytes,
       fileCount: node.file_count,
       folderCount: node.directory_count,
       percentOfParent: node.percent_of_parent,
@@ -758,7 +759,7 @@ function TreeSizeView({
         style={style}
         className="border-b hover:bg-muted/30 transition-colors"
       >
-        <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] text-sm h-full">
+        <div className="grid grid-cols-[auto_1fr_repeat(7,auto)] text-sm h-full">
           {/* Expand/collapse button with proper indentation */}
           <div
             className="p-1 flex items-center justify-center cursor-pointer"
@@ -810,6 +811,11 @@ function TreeSizeView({
             {formatSize(item.sizeBytes)}
           </div>
 
+          {/* Always show allocated size */}
+          <div className="p-2 text-right font-mono w-24">
+            {formatSize(item.allocatedBytes)}
+          </div>
+
           {/* Always show percent of parent */}
           <div
             className={`p-2 text-right font-mono w-24 ${
@@ -839,10 +845,11 @@ function TreeSizeView({
   return (
     <div className="h-full flex flex-col">
       {/* Header - Sticky */}
-      <div className="grid grid-cols-[auto_1fr_repeat(6,auto)] sticky top-0 bg-muted/90 text-sm font-medium border-b select-none z-10 shadow-sm flex-shrink-0">
+      <div className="grid grid-cols-[auto_1fr_repeat(7,auto)] sticky top-0 bg-muted/90 text-sm font-medium border-b select-none z-10 shadow-sm flex-shrink-0">
         <div className="w-6"></div>
         <div className="p-2">Name</div>
         <div className="p-2 text-right w-24">Size</div>
+        <div className="p-2 text-right w-24">Allocated</div>
         <div className="p-2 text-right w-24">% of Parent</div>
         <div className="p-2 text-right w-16">Files</div>
         <div className="p-2 text-right w-16">Folders</div>
