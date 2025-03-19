@@ -59,6 +59,7 @@ interface FileSystemTreeNode {
   file_count: number
   directory_count: number
   percent_of_parent: number
+  last_modified_time: number
   children: FileSystemTreeNode[]
 }
 
@@ -328,7 +329,9 @@ export function DirectoryScanner() {
       fileCount: node.file_count,
       folderCount: node.directory_count,
       percentOfParent: node.percent_of_parent,
-      lastModified: new Date().toLocaleDateString(), // Default date
+      lastModified: new Date(
+        node.last_modified_time * 1000
+      ).toLocaleDateString(), // Convert Unix timestamp to Date
       owner: "Unknown",
       depth,
       backgroundColor: getColorForPercentage(),
