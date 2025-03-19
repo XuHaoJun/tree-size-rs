@@ -26,6 +26,8 @@ struct AnalyticsInfo {
   directory_count: AtomicU64,
   /// Last modified time (Unix timestamp in seconds)
   last_modified_time: AtomicU64,
+  /// Owner of the file or directory
+  owner_name: Option<String>,
 }
 
 /// Represents size information for a file or directory
@@ -45,6 +47,8 @@ struct FileSystemEntry {
   directory_count: u64,
   /// last modified time
   last_modified_time: u64,
+  /// Owner of the file or directory
+  owner_name: Option<String>,
 }
 
 /// Represents a node in the file system tree
@@ -68,6 +72,8 @@ struct FileSystemTreeNode {
   percent_of_parent: f64,
   /// Last modified time (Unix timestamp in seconds)
   last_modified_time: u64,
+  /// Owner of the file or directory
+  owner_name: Option<String>,
   /// Child nodes
   children: Vec<FileSystemTreeNode>,
 }
@@ -132,6 +138,7 @@ fn calculate_size_sync(
         file_count: AtomicU64::new(file_count),
         directory_count: AtomicU64::new(directory_count),
         last_modified_time: AtomicU64::new(path_info.times.0 as u64),
+        owner_name: path_info.owner_name,
       });
       e.insert(analytics.clone());
       analytics
@@ -248,6 +255,7 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         file_count: analytics.file_count.load(Ordering::Relaxed),
         directory_count: analytics.directory_count.load(Ordering::Relaxed),
         last_modified_time: analytics.last_modified_time.load(Ordering::Relaxed) as u64,
+        owner_name: analytics.owner_name.clone(),
       }
     })
     .collect()
@@ -351,6 +359,7 @@ fn build_tree_from_entries_with_depth(
       directory_count: entry.directory_count,
       percent_of_parent: 100.0, // Default value, will be updated by parent
       last_modified_time: entry.last_modified_time,
+      owner_name: entry.owner_name.clone(),
       children,
     }
   }
@@ -425,6 +434,7 @@ fn build_tree_from_indices(
               0.0
             },
             last_modified_time: child_entry.last_modified_time,
+            owner_name: child_entry.owner_name.clone(),
             children: Vec::new(), // No need to build children of children here
           };
 
@@ -445,6 +455,7 @@ fn build_tree_from_indices(
       directory_count: entry.directory_count,
       percent_of_parent: 100.0, // Default value, will be updated by parent
       last_modified_time: entry.last_modified_time,
+      owner_name: entry.owner_name.clone(),
       children,
     }
   }
@@ -1095,6 +1106,101 @@ mod tests {
     // Calculate and print the speedup
     let speedup = sequential_duration.as_secs_f64() / parallel_duration.as_secs_f64();
     println!("Speedup from parallelism: {:.2}x", speedup);
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  #[cfg(target_family = "unix")]
+  async fn test_owner_name_unix() -> std::io::Result<()> {
+    // Create a temporary directory with a file
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path().to_path_buf();
+    let file_path = path.join("test_owner.txt");
+    let mut file = File::create(&file_path)?;
+    file.write_all(b"Testing owner")?;
+
+    // Get path info directly
+    let path_info = platform::get_path_info(&file_path, false);
+    assert!(path_info.is_some(), "Should get path info");
+    
+    let info = path_info.unwrap();
+    assert!(info.owner_name.is_some(), "Should have owner name on Unix");
+    
+    // Current user should be the owner of the file we just created
+    let current_user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME"));
+    if let Ok(username) = current_user {
+      assert_eq!(info.owner_name.as_deref(), Some(username.as_str()), 
+                "File should be owned by current user");
+    }
+    
+    // Test through the analytics map
+    let analytics_map = Arc::new(DashMap::new());
+    let visited_inodes = Arc::new(DashSet::new());
+    let processed_paths = Arc::new(DashSet::new());
+
+    calculate_size_sync(
+      path.clone(),
+      analytics_map.clone(),
+      None,
+      visited_inodes,
+      processed_paths,
+    )?;
+
+    // Convert to entries and check owner_name is preserved
+    let entries = analytics_map_to_entries(&analytics_map);
+    let file_entry = entries.iter().find(|e| e.path == file_path);
+    
+    assert!(file_entry.is_some(), "File entry should exist");
+    if let Some(entry) = file_entry {
+      assert!(entry.owner_name.is_some(), "Owner name should be present in entry");
+    }
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  #[cfg(target_os = "windows")]
+  async fn test_owner_name_windows() -> std::io::Result<()> {
+    // Create a temporary directory with a file
+    let temp_dir = tempdir()?;
+    let path = temp_dir.path().to_path_buf();
+    let file_path = path.join("test_owner.txt");
+    let mut file = File::create(&file_path)?;
+    file.write_all(b"Testing owner")?;
+
+    // Get path info directly
+    let path_info = platform::get_path_info(&file_path, false);
+    assert!(path_info.is_some(), "Should get path info");
+    
+    let info = path_info.unwrap();
+    assert!(info.owner_name.is_some(), "Should have owner name on Windows");
+    
+    // Test through the analytics map
+    let analytics_map = Arc::new(DashMap::new());
+    let visited_inodes = Arc::new(DashSet::new());
+    let processed_paths = Arc::new(DashSet::new());
+
+    calculate_size_sync(
+      path.clone(),
+      analytics_map.clone(),
+      None,
+      visited_inodes,
+      processed_paths,
+    )?;
+
+    // Convert to entries and check owner_name is preserved
+    let entries = analytics_map_to_entries(&analytics_map);
+    let file_entry = entries.iter().find(|e| e.path == file_path);
+    
+    assert!(file_entry.is_some(), "File entry should exist");
+    if let Some(entry) = file_entry {
+      assert!(entry.owner_name.is_some(), "Owner name should be present in entry");
+      
+      // On Windows we can't easily predict the username, but it should be non-empty
+      assert!(!entry.owner_name.as_ref().unwrap().is_empty(), 
+              "Owner name should not be empty");
+    }
 
     Ok(())
   }
