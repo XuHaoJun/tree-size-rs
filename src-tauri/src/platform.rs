@@ -333,7 +333,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
   use std::ffi::OsString;
   use std::os::windows::ffi::{OsStringExt, OsStrExt};
   use winapi::um::aclapi::GetNamedSecurityInfoW;
-  use winapi::um::winnt::{PSID, SidTypeUser, OWNER_SECURITY_INFORMATION};
+  use winapi::um::winnt::{PSID, SidTypeUser, SidTypeWellKnownGroup, SidTypeAlias, SidTypeDeletedAccount, OWNER_SECURITY_INFORMATION};
   use winapi::um::accctrl::SE_FILE_OBJECT;
   use winapi::shared::winerror::ERROR_SUCCESS;
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
@@ -425,18 +425,24 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       return None;
     }
     
-    // Ensure we have a user
-    if sid_type != SidTypeUser {
-      eprintln!("SID type is not user: {}", sid_type);
-      return None;
-    }
-    
-    // Convert to OsString then to String, handling the case where name_size includes null terminator
-    let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
-    match name.into_string() {
-      Ok(name_str) => Some(name_str),
-      Err(_) => {
-        eprintln!("Failed to convert name to string");
+    // Accept more SID types - not just users but also groups and aliases
+    match sid_type {
+      t if t == SidTypeUser || t == SidTypeWellKnownGroup || t == SidTypeAlias => {
+        // These are all valid owner types
+        let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
+        match name.into_string() {
+          Ok(name_str) => Some(name_str),
+          Err(_) => {
+            eprintln!("Failed to convert name to string");
+            None
+          }
+        }
+      }
+      t if t == SidTypeDeletedAccount => {
+        Some("<deleted account>".to_string())
+      }
+      _ => {
+        eprintln!("Unsupported SID type: {}", sid_type);
         None
       }
     }
