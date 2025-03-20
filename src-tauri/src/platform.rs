@@ -360,6 +360,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     );
     
     if status != ERROR_SUCCESS {
+      eprintln!("GetNamedSecurityInfoW failed with status: {}", status);
       return None;
     }
 
@@ -376,6 +377,12 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     let mut owner: PSID = std::ptr::null_mut();
     let mut owner_defaulted = 0;
     if GetSecurityDescriptorOwner(sd, &mut owner, &mut owner_defaulted) == 0 {
+      eprintln!("GetSecurityDescriptorOwner failed");
+      return None;
+    }
+    
+    if owner.is_null() {
+      eprintln!("Owner SID is null");
       return None;
     }
     
@@ -396,10 +403,11 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     );
     
     if name_size == 0 {
+      eprintln!("LookupAccountSidW failed to get buffer sizes");
       return None;
     }
     
-    // Allocate buffers with proper size (+1 for null terminator)
+    // Allocate buffers with proper size
     let mut name_buf = vec![0u16; name_size as usize];
     let mut domain_buf = vec![0u16; domain_size as usize];
     
@@ -413,17 +421,25 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       &mut domain_size,
       &mut sid_type
     ) == 0 {
+      eprintln!("LookupAccountSidW failed to get account info");
       return None;
     }
     
     // Ensure we have a user
     if sid_type != SidTypeUser {
+      eprintln!("SID type is not user: {}", sid_type);
       return None;
     }
     
     // Convert to OsString then to String, handling the case where name_size includes null terminator
     let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
-    name.into_string().ok()
+    match name.into_string() {
+      Ok(name_str) => Some(name_str),
+      Err(_) => {
+        eprintln!("Failed to convert name to string");
+        None
+      }
+    }
   }
 }
 

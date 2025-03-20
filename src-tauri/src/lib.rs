@@ -1162,6 +1162,8 @@ mod tests {
   #[tokio::test]
   #[cfg(target_os = "windows")]
   async fn test_owner_name_windows() -> std::io::Result<()> {
+    use std::fs::metadata;
+    
     // Create a temporary directory with a file
     let temp_dir = tempdir()?;
     let path = temp_dir.path().to_path_buf();
@@ -1169,12 +1171,23 @@ mod tests {
     let mut file = File::create(&file_path)?;
     file.write_all(b"Testing owner")?;
 
-    // Get path info directly
+    // Get metadata directly first to verify file creation
+    let file_metadata = metadata(&file_path)?;
+    assert!(file_metadata.is_file(), "Should be a file");
+
+    // Get path info directly with debug output
+    println!("Attempting to get path info for: {:?}", file_path);
     let path_info = platform::get_path_info(&file_path, false);
-    assert!(path_info.is_some(), "Should get path info");
     
-    let info = path_info.unwrap();
-    assert!(info.owner_name.is_some(), "Should have owner name on Windows");
+    match &path_info {
+        Some(info) => {
+            println!("Got path info with owner: {:?}", info.owner_name);
+            assert!(info.owner_name.is_some(), "Should have owner name on Windows");
+        }
+        None => {
+            panic!("Failed to get path info for file");
+        }
+    }
     
     // Test through the analytics map
     let analytics_map = Arc::new(DashMap::new());
@@ -1193,13 +1206,15 @@ mod tests {
     let entries = analytics_map_to_entries(&analytics_map);
     let file_entry = entries.iter().find(|e| e.path == file_path);
     
-    assert!(file_entry.is_some(), "File entry should exist");
-    if let Some(entry) = file_entry {
-      assert!(entry.owner_name.is_some(), "Owner name should be present in entry");
-      
-      // On Windows we can't easily predict the username, but it should be non-empty
-      assert!(!entry.owner_name.as_ref().unwrap().is_empty(), 
-              "Owner name should not be empty");
+    match file_entry {
+        Some(entry) => {
+            println!("Found file entry with owner: {:?}", entry.owner_name);
+            assert!(entry.owner_name.is_some(), "Owner name should be present in entry");
+            assert!(!entry.owner_name.as_ref().unwrap().is_empty(), "Owner name should not be empty");
+        }
+        None => {
+            panic!("File entry not found in analytics map");
+        }
     }
 
     Ok(())
