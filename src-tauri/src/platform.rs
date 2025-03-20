@@ -329,10 +329,12 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Opt
 fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Option<String> {
   use std::ffi::OsString;
   use std::os::windows::ffi::{OsStringExt, OsStrExt};
-  use winapi::um::winbase::GetNamedSecurityInfoW;
-  use winapi::um::winnt::{PSID, SidTypeUser, OWNER_SECURITY_INFORMATION, SE_FILE_OBJECT};
+  use winapi::um::aclapi::GetNamedSecurityInfoW;
+  use winapi::um::winnt::{PSID, SidTypeUser, OWNER_SECURITY_INFORMATION};
+  use winapi::um::accctrl::SE_FILE_OBJECT;
   use winapi::shared::winerror::ERROR_SUCCESS;
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
+  use winapi::um::winbase::LocalFree;
   
   let path = _path.as_ref();
   let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -409,7 +411,7 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Op
     // Convert to OsString then to String
     let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
     // Free security descriptor
-    winapi::um::securitybaseapi::LocalFree(sd as *mut _);
+    LocalFree(sd as *mut _);
     Some(name.to_string_lossy().into_owned())
   }
 }
