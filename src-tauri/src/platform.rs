@@ -322,7 +322,10 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Opt
   use users::get_user_by_uid;
   
   let uid = metadata.uid();
-  get_user_by_uid(uid).map(|user| user.name().to_string_lossy().into_owned())
+  match get_user_by_uid(uid) {
+    Some(user) => Some(user.name().to_string_lossy().into_owned()),
+    None => Some(format!("<deleted user {}>", uid)) // More explicit format for deleted users
+  }
 }
 
 #[cfg(target_os = "windows")]
