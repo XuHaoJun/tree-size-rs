@@ -326,7 +326,7 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Opt
 }
 
 #[cfg(target_os = "windows")]
-fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Option<String> {
+fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Option<String> {
   use std::ffi::OsString;
   use std::os::windows::ffi::{OsStringExt, OsStrExt};
   use winapi::um::aclapi::GetNamedSecurityInfoW;
@@ -336,7 +336,7 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Op
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
   use winapi::um::winbase::LocalFree;
   
-  let path = _path.as_ref();
+  let path = path.as_ref();
   let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
   
   unsafe {
@@ -358,6 +358,15 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Op
     if status != ERROR_SUCCESS {
       return None;
     }
+
+    // Ensure proper cleanup of security descriptor
+    struct SdCleanup(*mut std::ffi::c_void);
+    impl Drop for SdCleanup {
+      fn drop(&mut self) {
+        unsafe { LocalFree(self.0) };
+      }
+    }
+    let _sd_cleanup = SdCleanup(sd);
     
     // Get the SID owner
     let mut owner: PSID = std::ptr::null_mut();
@@ -386,7 +395,7 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Op
       return None;
     }
     
-    // Allocate buffers
+    // Allocate buffers with proper size (+1 for null terminator)
     let mut name_buf = vec![0u16; name_size as usize];
     let mut domain_buf = vec![0u16; domain_size as usize];
     
@@ -408,11 +417,9 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Op
       return None;
     }
     
-    // Convert to OsString then to String
+    // Convert to OsString then to String, handling the case where name_size includes null terminator
     let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
-    // Free security descriptor
-    LocalFree(sd as *mut _);
-    Some(name.to_string_lossy().into_owned())
+    name.into_string().ok()
   }
 }
 
