@@ -39,3 +39,38 @@ In this session, we implemented file owner information support throughout the ap
   - Platform limitations
 
 - The implementation handles cross-platform compatibility while providing platform-specific optimizations.
+
+## Windows Owner Name Fix:
+
+The initial Windows implementation had a limitation where it only accepted `SidTypeUser` as a valid owner type. However, Windows files can be owned by various security principal types. The fix involved:
+
+1. **Extended SID Type Support**:
+   - Added support for multiple SID types:
+     - `SidTypeUser` (1): Regular user accounts
+     - `SidTypeWellKnownGroup` (2): Built-in groups like "Administrators"
+     - `SidTypeAlias` (4): Local group accounts
+     - `SidTypeDeletedAccount` (6): Deleted accounts
+
+2. **Improved Error Handling**:
+   - Added detailed error logging at each potential failure point
+   - Added specific handling for deleted accounts
+   - Better error messages for debugging ownership issues
+
+3. **Key Code Changes**:
+   ```rust
+   match sid_type {
+     t if t == SidTypeUser || t == SidTypeWellKnownGroup || t == SidTypeAlias => {
+       // Accept users, well-known groups, and local groups as valid owners
+       // Convert name and return
+     }
+     t if t == SidTypeDeletedAccount => {
+       Some("<deleted account>".to_string())
+     }
+     _ => {
+       eprintln!("Unsupported SID type: {}", sid_type);
+       None
+     }
+   }
+   ```
+
+This fix ensures proper owner name resolution on Windows, handling the full range of possible file owners in the Windows security model.
