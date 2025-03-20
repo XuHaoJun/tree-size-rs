@@ -338,6 +338,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
   use winapi::shared::winerror::ERROR_SUCCESS;
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
   use winapi::um::winbase::LocalFree;
+  use winapi::ctypes::c_void;
   
   let path = path.as_ref();
   let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -363,7 +364,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     }
 
     // Ensure proper cleanup of security descriptor
-    struct SdCleanup(*mut std::ffi::c_void);
+    struct SdCleanup(*mut c_void);
     impl Drop for SdCleanup {
       fn drop(&mut self) {
         unsafe { LocalFree(self.0) };
