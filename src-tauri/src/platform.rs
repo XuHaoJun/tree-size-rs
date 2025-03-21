@@ -35,14 +35,12 @@ pub struct PathInfo {
 }
 
 /// Get complete path information in a platform-agnostic way
-pub fn get_path_info<P: AsRef<Path>>(
-  path: P,
-  follow_links: bool,
-) -> Option<PathInfo> {
+pub fn get_path_info<P: AsRef<Path>>(path: P, follow_links: bool) -> Option<PathInfo> {
   let path_ref = path.as_ref();
 
   // First get the metadata
-  let (size_bytes, size_allocated_bytes, inode_device, times) = get_metadata(path_ref, follow_links)?;
+  let (size_bytes, size_allocated_bytes, inode_device, times) =
+    get_metadata(path_ref, follow_links)?;
 
   // Then determine if it's a directory
   let metadata = if follow_links {
@@ -54,7 +52,7 @@ pub fn get_path_info<P: AsRef<Path>>(
   let is_dir = metadata.is_dir();
   let is_file = metadata.is_file();
   let is_symlink = metadata.file_type().is_symlink();
-  
+
   // Get the owner name
   let owner_name = get_owner_name(path_ref, &metadata);
 
@@ -87,7 +85,7 @@ pub fn get_metadata<P: AsRef<Path>>(
       let size = md.len();
       // Allocated size
       let size_allocated = md.blocks() * get_block_size();
-      
+
       Some((
         size,
         size_allocated,
@@ -175,12 +173,12 @@ pub fn get_metadata<P: AsRef<Path>>(
   }
 
   fn get_metadata_expensive(path: &Path) -> Option<(u64, u64, Option<InodeAndDevice>, FileTime)> {
-    use winapi_util::file::information;
     use filesize::PathExt;
+    use winapi_util::file::information;
 
     let h = handle_from_path_limited(path).ok()?;
     let info = information(&h).ok()?;
-    
+
     // Get both sizes
     let apparent_size = info.file_size();
     let allocated_size = path.size_on_disk().unwrap_or(apparent_size);
@@ -234,12 +232,12 @@ pub fn get_metadata<P: AsRef<Path>>(
       {
         // For normal files, we use the standard metadata
         let apparent_size = md.len();
-        
+
         // For simple files, apparent size is often the same as allocated size
         // But we would need an expensive call to get the exact allocated size
         // We'll just use apparent size for both in this simple case
         let allocated_size = apparent_size;
-        
+
         Some((
           apparent_size,
           allocated_size,
@@ -327,33 +325,40 @@ pub fn get_space_info<P: AsRef<Path>>(path: P) -> Option<(u64, u64, u64)> {
 fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Option<String> {
   use std::os::unix::fs::MetadataExt;
   use users::get_user_by_uid;
-  
+
   let uid = metadata.uid();
   match get_user_by_uid(uid) {
     Some(user) => Some(user.name().to_string_lossy().into_owned()),
-    None => Some(format!("<deleted user {}>", uid)) // More explicit format for deleted users
+    None => Some(format!("<deleted user {}>", uid)), // More explicit format for deleted users
   }
 }
 
 #[cfg(target_os = "windows")]
 fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Option<String> {
   use std::ffi::OsString;
-  use std::os::windows::ffi::{OsStringExt, OsStrExt};
-  use winapi::um::aclapi::GetNamedSecurityInfoW;
-  use winapi::um::winnt::{PSID, SidTypeUser, SidTypeWellKnownGroup, SidTypeAlias, SidTypeDeletedAccount, OWNER_SECURITY_INFORMATION};
-  use winapi::um::accctrl::SE_FILE_OBJECT;
+  use std::os::windows::ffi::{OsStrExt, OsStringExt};
+  use winapi::ctypes::c_void;
   use winapi::shared::winerror::ERROR_SUCCESS;
+  use winapi::um::accctrl::SE_FILE_OBJECT;
+  use winapi::um::aclapi::GetNamedSecurityInfoW;
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
   use winapi::um::winbase::LocalFree;
-  use winapi::ctypes::c_void;
-  
+  use winapi::um::winnt::{
+    SidTypeAlias, SidTypeDeletedAccount, SidTypeUser, SidTypeWellKnownGroup,
+    OWNER_SECURITY_INFORMATION, PSID,
+  };
+
   let path = path.as_ref();
-  let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-  
+  let path_wide: Vec<u16> = path
+    .as_os_str()
+    .encode_wide()
+    .chain(std::iter::once(0))
+    .collect();
+
   unsafe {
     let mut sid: PSID = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
-    
+
     // Get security descriptor
     let status = GetNamedSecurityInfoW(
       path_wide.as_ptr(),
@@ -363,9 +368,9 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       std::ptr::null_mut(),
       std::ptr::null_mut(),
       std::ptr::null_mut(),
-      &mut sd
+      &mut sd,
     );
-    
+
     if status != ERROR_SUCCESS {
       eprintln!("GetNamedSecurityInfoW failed with status: {}", status);
       return None;
@@ -379,7 +384,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       }
     }
     let _sd_cleanup = SdCleanup(sd);
-    
+
     // Get the SID owner
     let mut owner: PSID = std::ptr::null_mut();
     let mut owner_defaulted = 0;
@@ -387,17 +392,17 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       eprintln!("GetSecurityDescriptorOwner failed");
       return None;
     }
-    
+
     if owner.is_null() {
       eprintln!("Owner SID is null");
       return None;
     }
-    
+
     // Convert SID to name
     let mut name_size = 0;
     let mut domain_size = 0;
     let mut sid_type = 0;
-    
+
     // First call to get buffer sizes
     winapi::um::winbase::LookupAccountSidW(
       std::ptr::null(),
@@ -406,18 +411,18 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       &mut name_size,
       std::ptr::null_mut(),
       &mut domain_size,
-      &mut sid_type
+      &mut sid_type,
     );
-    
+
     if name_size == 0 {
       eprintln!("LookupAccountSidW failed to get buffer sizes");
       return None;
     }
-    
+
     // Allocate buffers with proper size
     let mut name_buf = vec![0u16; name_size as usize];
     let mut domain_buf = vec![0u16; domain_size as usize];
-    
+
     // Second call to get actual data
     if winapi::um::winbase::LookupAccountSidW(
       std::ptr::null(),
@@ -426,12 +431,13 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       &mut name_size,
       domain_buf.as_mut_ptr(),
       &mut domain_size,
-      &mut sid_type
-    ) == 0 {
+      &mut sid_type,
+    ) == 0
+    {
       eprintln!("LookupAccountSidW failed to get account info");
       return None;
     }
-    
+
     // Accept more SID types - not just users but also groups and aliases
     match sid_type {
       t if t == SidTypeUser || t == SidTypeWellKnownGroup || t == SidTypeAlias => {
@@ -445,9 +451,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
           }
         }
       }
-      t if t == SidTypeDeletedAccount => {
-        Some("<deleted account>".to_string())
-      }
+      t if t == SidTypeDeletedAccount => Some("<deleted account>".to_string()),
       _ => {
         eprintln!("Unsupported SID type: {}", sid_type);
         None
