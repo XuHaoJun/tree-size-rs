@@ -19,13 +19,13 @@ struct AnalyticsInfo {
   /// Total size in bytes on disk
   size_allocated_bytes: AtomicU64,
   /// Total number of entries (files and directories)
-  entry_count: AtomicU64,
+  entry_count: u64,
   /// Number of files
-  file_count: AtomicU64,
+  file_count: u64,
   /// Number of directories
-  directory_count: AtomicU64,
+  directory_count: u64,
   /// Last modified time (Unix timestamp in seconds)
-  last_modified_time: AtomicU64,
+  last_modified_time: u64,
   /// Owner of the file or directory
   owner_name: Option<String>,
 }
@@ -91,20 +91,20 @@ struct DirectoryScanResult {
 
 // Efficient sync function that uses Rayon for parallel processing
 fn calculate_size_sync(
-  path: PathBuf,
-  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
-  target_dir_path: Option<PathBuf>,
+  path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, AnalyticsInfo>>,
+  target_dir_path: Option<&Path>,
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
   // If we've already processed this path, skip it
-  if !processed_paths.insert(path.clone()) {
+  if !processed_paths.insert(path.to_path_buf()) {
     return Ok(());
   }
 
   // Get path info using our platform-agnostic function - will work for files, dirs and symlinks
   let is_symlink = path.is_symlink();
-  let path_info = match platform::get_path_info(&path, is_symlink) {
+  let path_info = match platform::get_path_info(path, is_symlink) {
     Some(info) => info,
     None => return Ok(()),
   };
@@ -128,27 +128,22 @@ fn calculate_size_sync(
   };
 
   // Add entry to analytics map with initial values (will be updated later for directories)
-  let entry_analytics = match analytics_map.entry(path.clone()) {
-    dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
-    dashmap::mapref::entry::Entry::Vacant(e) => {
-      let analytics = Arc::new(AnalyticsInfo {
-        size_bytes: AtomicU64::new(path_info.size_bytes),
-        size_allocated_bytes: AtomicU64::new(path_info.size_allocated_bytes),
-        entry_count: AtomicU64::new(entry_count),
-        file_count: AtomicU64::new(file_count),
-        directory_count: AtomicU64::new(directory_count),
-        last_modified_time: AtomicU64::new(path_info.times.0 as u64),
-        owner_name: path_info.owner_name,
-      });
-      e.insert(analytics.clone());
-      analytics
-    }
-  };
+  let mut entry_analytics = analytics_map
+    .entry(path.to_path_buf())
+    .or_insert(AnalyticsInfo {
+      size_bytes: AtomicU64::new(path_info.size_bytes),
+      size_allocated_bytes: AtomicU64::new(path_info.size_allocated_bytes),
+      entry_count: entry_count,
+      file_count: file_count,
+      directory_count: directory_count,
+      last_modified_time: path_info.times.0 as u64,
+      owner_name: path_info.owner_name,
+    });
 
   // For directories, process all children (but don't follow symlinks)
   if path_info.is_dir && !is_symlink {
     // Read directory entries
-    let entries = match std::fs::read_dir(&path) {
+    let entries = match std::fs::read_dir(path) {
       Ok(dir_entries) => {
         let mut entry_paths = Vec::with_capacity(32); // Pre-allocate for common case
         for entry_result in dir_entries {
@@ -161,16 +156,47 @@ fn calculate_size_sync(
       Err(_) => Vec::new(),
     };
 
-    // Process all children in parallel using Rayon
-    entries.par_iter().for_each(|child_path| {
-      let _ = calculate_size_sync(
-        child_path.clone(),
-        analytics_map.clone(),
-        target_dir_path.clone(),
-        visited_inodes.clone(),
-        processed_paths.clone(),
-      );
+    // Sort entries to ensure symlinks are processed after regular files
+    // This ensures inode checking works correctly in sequential processing
+    let mut sorted_entries = entries.clone();
+    sorted_entries.sort_by(|a, b| {
+      let a_is_symlink = a.is_symlink();
+      let b_is_symlink = b.is_symlink();
+      
+      // 符號連結排在後面
+      if a_is_symlink && !b_is_symlink {
+        std::cmp::Ordering::Greater
+      } else if !a_is_symlink && b_is_symlink {
+        std::cmp::Ordering::Less
+      } else {
+        a.file_name().cmp(&b.file_name())
+      }
     });
+
+    // Process children based on directory size
+    if sorted_entries.len() < 100 {
+      // Use sequential processing for small directories
+      for child_path in &sorted_entries {
+        let _ = calculate_size_sync(
+          child_path.as_path(),
+          analytics_map.clone(),
+          target_dir_path,
+          visited_inodes.clone(),
+          processed_paths.clone(),
+        );
+      }
+    } else {
+      // Use parallel processing for larger directories
+      sorted_entries.par_iter().for_each(|child_path| {
+        let _ = calculate_size_sync(
+          child_path.as_path(),
+          analytics_map.clone(),
+          target_dir_path,
+          visited_inodes.clone(),
+          processed_paths.clone(),
+        );
+      });
+    }
 
     // Now compute the total size based on children
     let dir_own_size = path_info.size_bytes; // Start with directory's own size
@@ -182,7 +208,7 @@ fn calculate_size_sync(
     let mut total_dirs = 1; // Count this directory
 
     // Sum up all children's contributions
-    for child_path in &entries {
+    for child_path in &sorted_entries {
       // Check if the child is a direct file (not a symlink pointing to a file)
       let child_is_file = child_path.is_file() && !child_path.is_symlink();
 
@@ -193,12 +219,12 @@ fn calculate_size_sync(
       }
 
       // Get analytics info for the child if it exists
-      if let Some(child_analytics) = analytics_map.get(child_path) {
+      if let Some(child_analytics) = analytics_map.get(child_path.as_path()) {
         let child_size = child_analytics.size_bytes.load(Ordering::Relaxed);
         let child_allocated_size = child_analytics.size_allocated_bytes.load(Ordering::Relaxed);
-        let child_entries = child_analytics.entry_count.load(Ordering::Relaxed);
-        let child_files = child_analytics.file_count.load(Ordering::Relaxed);
-        let child_dirs = child_analytics.directory_count.load(Ordering::Relaxed);
+        let child_entries = child_analytics.entry_count;
+        let child_files = child_analytics.file_count;
+        let child_dirs = child_analytics.directory_count;
 
         total_size += child_size;
         total_allocated_size += child_allocated_size;
@@ -225,22 +251,16 @@ fn calculate_size_sync(
     entry_analytics
       .size_allocated_bytes
       .store(total_allocated_size, Ordering::Relaxed);
-    entry_analytics
-      .entry_count
-      .store(total_entries, Ordering::Relaxed);
-    entry_analytics
-      .file_count
-      .store(total_files, Ordering::Relaxed);
-    entry_analytics
-      .directory_count
-      .store(total_dirs, Ordering::Relaxed);
+    entry_analytics.entry_count = total_entries;
+    entry_analytics.file_count = total_files;
+    entry_analytics.directory_count = total_dirs;
   }
 
   Ok(())
 }
 
 // This function converts the analytics map to a vector of FileSystemEntry objects
-fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<FileSystemEntry> {
+fn analytics_map_to_entries(map: &DashMap<PathBuf, AnalyticsInfo>) -> Vec<FileSystemEntry> {
   map
     .iter()
     .map(|item| {
@@ -251,10 +271,10 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         path: path.clone(),
         size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
         size_allocated_bytes: analytics.size_allocated_bytes.load(Ordering::Relaxed),
-        entry_count: analytics.entry_count.load(Ordering::Relaxed),
-        file_count: analytics.file_count.load(Ordering::Relaxed),
-        directory_count: analytics.directory_count.load(Ordering::Relaxed),
-        last_modified_time: analytics.last_modified_time.load(Ordering::Relaxed) as u64,
+        entry_count: analytics.entry_count,
+        file_count: analytics.file_count,
+        directory_count: analytics.directory_count,
+        last_modified_time: analytics.last_modified_time,
         owner_name: analytics.owner_name.clone(),
       }
     })
@@ -518,7 +538,7 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
   let start_time = std::time::Instant::now();
 
   let target_dir = Path::new(&path).canonicalize()?;
-  let analytics_map = Arc::new(DashMap::new());
+  let analytics_map: Arc<DashMap<PathBuf, AnalyticsInfo>> = Arc::new(DashMap::new());
   let visited_inodes = Arc::new(DashSet::new());
   let processed_paths = Arc::new(DashSet::new());
 
@@ -529,9 +549,9 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
   let scan_task = tokio::task::spawn_blocking(move || {
     // Run the synchronous calculation using Rayon's parallel processing
     calculate_size_sync(
-      target_dir_clone.clone(),
+      &target_dir_clone,
       analytics_map_clone.clone(),
-      Some(target_dir_clone.clone()),
+      Some(&target_dir_clone),
       visited_inodes,
       processed_paths,
     )
@@ -790,7 +810,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None, // No target directory
       visited_inodes,
@@ -818,19 +838,10 @@ mod tests {
       "Directory size might be 0 on Windows"
     );
 
+    assert_eq!(analytics.entry_count, 1, "Should count itself as one entry");
+    assert_eq!(analytics.file_count, 0, "Should have 0 files");
     assert_eq!(
-      analytics.entry_count.load(Ordering::Relaxed),
-      1,
-      "Should count itself as one entry"
-    );
-    assert_eq!(
-      analytics.file_count.load(Ordering::Relaxed),
-      0,
-      "Should have 0 files"
-    );
-    assert_eq!(
-      analytics.directory_count.load(Ordering::Relaxed),
-      1,
+      analytics.directory_count, 1,
       "Should count itself as one directory"
     );
 
@@ -856,7 +867,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -874,19 +885,10 @@ mod tests {
       analytics.size_bytes.load(Ordering::Relaxed) >= test_data.len() as u64,
       "Directory size should include the file size"
     );
+    assert_eq!(analytics.entry_count, 2, "Should count itself and one file");
+    assert_eq!(analytics.file_count, 1, "Should have 1 file");
     assert_eq!(
-      analytics.entry_count.load(Ordering::Relaxed),
-      2,
-      "Should count itself and one file"
-    );
-    assert_eq!(
-      analytics.file_count.load(Ordering::Relaxed),
-      1,
-      "Should have 1 file"
-    );
-    assert_eq!(
-      analytics.directory_count.load(Ordering::Relaxed),
-      1,
+      analytics.directory_count, 1,
       "Should count itself as one directory"
     );
 
@@ -922,7 +924,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -942,18 +944,12 @@ mod tests {
       "Directory size should include all files and subdirectories"
     );
     assert_eq!(
-      root_analytics.entry_count.load(Ordering::Relaxed),
-      4,
+      root_analytics.entry_count, 4,
       "Should count root dir, subdir, and 2 files"
     );
+    assert_eq!(root_analytics.file_count, 2, "Should have 2 files");
     assert_eq!(
-      root_analytics.file_count.load(Ordering::Relaxed),
-      2,
-      "Should have 2 files"
-    );
-    assert_eq!(
-      root_analytics.directory_count.load(Ordering::Relaxed),
-      2,
+      root_analytics.directory_count, 2,
       "Should count root and subdirectory"
     );
 
@@ -969,18 +965,12 @@ mod tests {
       "Subdirectory size should include its file size"
     );
     assert_eq!(
-      subdir_analytics.entry_count.load(Ordering::Relaxed),
-      2,
+      subdir_analytics.entry_count, 2,
       "Should count subdir and its file"
     );
+    assert_eq!(subdir_analytics.file_count, 1, "Should have 1 file");
     assert_eq!(
-      subdir_analytics.file_count.load(Ordering::Relaxed),
-      1,
-      "Should have 1 file"
-    );
-    assert_eq!(
-      subdir_analytics.directory_count.load(Ordering::Relaxed),
-      1,
+      subdir_analytics.directory_count, 1,
       "Should count itself as one directory"
     );
 
@@ -1011,7 +1001,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -1025,16 +1015,22 @@ mod tests {
     );
 
     let analytics = analytics_map.get(&path).unwrap();
-    // The symlink is counted in the entry count, but not as a file
-    // In some implementations, symlinks might be treated differently
-    assert!(
-      analytics.entry_count.load(Ordering::Relaxed) >= 2,
-      "Should count at least the directory and file"
-    );
+    
+    // 在我們的算法中，由於 inode 檢查，符號連結可能不會被重複計數
+    // 檢查 entry_count 是否為 2（目錄自身 + 1個文件）
     assert_eq!(
-      analytics.file_count.load(Ordering::Relaxed),
-      1,
+      analytics.entry_count, 2,
+      "Should count directory (1) + file (1), symlink is not double-counted due to inode check"
+    );
+    
+    assert_eq!(
+      analytics.file_count, 1,
       "Should count only the actual file, not the symlink as a file"
+    );
+    
+    assert_eq!(
+      analytics.directory_count, 1,
+      "Should count only the directory"
     );
 
     // Let's also check that the symlink exists
@@ -1063,7 +1059,7 @@ mod tests {
 
       // Use Rayon's default thread pool (parallel)
       calculate_size_sync(
-        test_dir.clone(),
+        test_dir.as_path(),
         analytics_map.clone(),
         None,
         visited_inodes,
@@ -1090,7 +1086,7 @@ mod tests {
 
       pool.install(|| {
         let _ = calculate_size_sync(
-          test_dir.clone(),
+          test_dir.as_path(),
           analytics_map.clone(),
           None,
           visited_inodes,
@@ -1143,7 +1139,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     calculate_size_sync(
-      path.clone(),
+      file_path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -1204,7 +1200,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     calculate_size_sync(
-      path.clone(),
+      file_path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
