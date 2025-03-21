@@ -100,6 +100,13 @@ pub fn get_metadata<P: AsRef<Path>>(
 }
 
 #[cfg(target_family = "windows")]
+fn windows_time_to_unix_time(windows_time: i64) -> i64 {
+  // Windows time is in 100ns intervals since 1601-01-01
+  // Convert to seconds and adjust for Unix epoch (1970-01-01)
+  (windows_time / 10_000_000) - 11644473600
+}
+
+#[cfg(target_family = "windows")]
 pub fn get_metadata<P: AsRef<Path>>(
   path: P,
   follow_links: bool,
@@ -183,9 +190,9 @@ pub fn get_metadata<P: AsRef<Path>>(
       allocated_size,
       Some((info.file_index(), info.volume_serial_number())),
       (
-        info.last_write_time().unwrap() as i64,
-        info.last_access_time().unwrap() as i64,
-        info.creation_time().unwrap() as i64,
+        windows_time_to_unix_time(info.last_write_time().unwrap() as i64),
+        windows_time_to_unix_time(info.last_access_time().unwrap() as i64),
+        windows_time_to_unix_time(info.creation_time().unwrap() as i64),
       ),
     ))
   }
@@ -238,9 +245,9 @@ pub fn get_metadata<P: AsRef<Path>>(
           allocated_size,
           None,
           (
-            md.last_write_time() as i64,
-            md.last_access_time() as i64,
-            md.creation_time() as i64,
+            windows_time_to_unix_time(md.last_write_time() as i64),
+            windows_time_to_unix_time(md.last_access_time() as i64),
+            windows_time_to_unix_time(md.creation_time() as i64),
           ),
         ))
       } else {
