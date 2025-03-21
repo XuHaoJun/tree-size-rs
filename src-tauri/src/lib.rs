@@ -91,20 +91,20 @@ struct DirectoryScanResult {
 
 // Efficient sync function that uses Rayon for parallel processing
 fn calculate_size_sync(
-  path: PathBuf,
+  path: &Path,
   analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
-  target_dir_path: Option<PathBuf>,
+  target_dir_path: Option<&Path>,
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
   // If we've already processed this path, skip it
-  if !processed_paths.insert(path.clone()) {
+  if !processed_paths.insert(path.to_path_buf()) {
     return Ok(());
   }
 
   // Get path info using our platform-agnostic function - will work for files, dirs and symlinks
   let is_symlink = path.is_symlink();
-  let path_info = match platform::get_path_info(&path, is_symlink) {
+  let path_info = match platform::get_path_info(path, is_symlink) {
     Some(info) => info,
     None => return Ok(()),
   };
@@ -128,7 +128,7 @@ fn calculate_size_sync(
   };
 
   // Add entry to analytics map with initial values (will be updated later for directories)
-  let entry_analytics = match analytics_map.entry(path.clone()) {
+  let entry_analytics = match analytics_map.entry(path.to_path_buf()) {
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
@@ -164,7 +164,7 @@ fn calculate_size_sync(
     // Process all children in parallel using Rayon
     entries.par_iter().for_each(|child_path| {
       let _ = calculate_size_sync(
-        child_path.clone(),
+        child_path,
         analytics_map.clone(),
         target_dir_path.clone(),
         visited_inodes.clone(),
@@ -529,9 +529,9 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
   let scan_task = tokio::task::spawn_blocking(move || {
     // Run the synchronous calculation using Rayon's parallel processing
     calculate_size_sync(
-      target_dir_clone.clone(),
+      target_dir_clone.as_path(),
       analytics_map_clone.clone(),
-      Some(target_dir_clone.clone()),
+      Some(target_dir_clone.as_path()),
       visited_inodes,
       processed_paths,
     )
@@ -790,7 +790,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None, // No target directory
       visited_inodes,
@@ -856,7 +856,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -922,7 +922,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -1011,7 +1011,7 @@ mod tests {
 
     // Run the function
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
@@ -1063,7 +1063,7 @@ mod tests {
 
       // Use Rayon's default thread pool (parallel)
       calculate_size_sync(
-        test_dir.clone(),
+        test_dir.as_path(),
         analytics_map.clone(),
         None,
         visited_inodes,
@@ -1090,7 +1090,7 @@ mod tests {
 
       pool.install(|| {
         let _ = calculate_size_sync(
-          test_dir.clone(),
+          test_dir.as_path(),
           analytics_map.clone(),
           None,
           visited_inodes,
@@ -1143,7 +1143,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
