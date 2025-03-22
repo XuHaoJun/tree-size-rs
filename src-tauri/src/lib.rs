@@ -255,55 +255,16 @@ fn calculate_size_ntfs(
     }
   });
   
-  // Make sure the target path itself is in the analytics map, even if not found in MFT
+  // Check if the target path is in the MFT records
   if !entries.iter().any(|(entry_path, _)| entry_path == path) {
-    // Get basic info about the directory using platform-specific functions
-    let path_info = platform::get_path_info(path, false);
+    // If we didn't find the target path in MFT, fall back to traditional method
+    eprintln!("Path {:?} not found in MFT, falling back to traditional method", path);
     
-    if let Some(info) = path_info {
-      analytics_map.insert(path.to_path_buf(), Arc::new(AnalyticsInfo {
-        size_bytes: info.size_bytes,
-        size_allocated_bytes: info.size_allocated_bytes,
-        entry_count: 1,
-        file_count: 0,
-        directory_count: 1,
-        last_modified_time: info.times.0 as u64,
-        owner_name: info.owner_name.clone(),
-        path_info: Some(info),
-      }));
-    } else {
-      // Fallback to basic metadata if platform-specific approach fails
-      if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.is_dir() {
-          let last_modified_time = metadata.modified()
-            .map(|time| time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
-            .unwrap_or(0);
-          
-          let size_bytes = 0; // Will be updated with children's sizes
-          let size_allocated_bytes = 0;
-          
-          analytics_map.insert(path.to_path_buf(), Arc::new(AnalyticsInfo {
-            size_bytes,
-            size_allocated_bytes,
-            entry_count: 1,
-            file_count: 0,
-            directory_count: 1,
-            last_modified_time,
-            owner_name: None,
-            path_info: Some(platform::PathInfo {
-              is_dir: true,
-              is_file: false,
-              is_symlink: false,
-              size_bytes,
-              size_allocated_bytes,
-              inode_device: None,
-              times: (last_modified_time as i64, 0, 0),
-              owner_name: None,
-            }),
-          }));
-        }
-      }
-    }
+    // We need to remove this path from processed_paths to ensure the traditional method processes it
+    processed_paths.remove(path);
+    
+    // Use the traditional calculation method for this path
+    return calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths);
   }
 
   // Group entries by parent path
