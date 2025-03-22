@@ -1204,7 +1204,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     calculate_size_sync(
-      path.clone(),
+      path.as_path(),
       analytics_map.clone(),
       None,
       visited_inodes,
