@@ -6,24 +6,23 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::Emitter;
 
 /// Contains analytics information for a directory or file
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AnalyticsInfo {
   /// Total size in bytes
-  size_bytes: AtomicU64,
+  size_bytes: u64,
   /// Total size in bytes on disk
-  size_allocated_bytes: AtomicU64,
+  size_allocated_bytes: u64,
   /// Total number of entries (files and directories)
-  entry_count: AtomicU64,
+  entry_count: u64,
   /// Number of files
-  file_count: AtomicU64,
+  file_count: u64,
   /// Number of directories
-  directory_count: AtomicU64,
+  directory_count: u64,
   /// Last modified time (Unix timestamp in seconds)
   last_modified_time: u64,
   /// Owner of the file or directory
@@ -132,11 +131,11 @@ fn calculate_size_sync(
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
-        size_bytes: AtomicU64::new(path_info.size_bytes),
-        size_allocated_bytes: AtomicU64::new(path_info.size_allocated_bytes),
-        entry_count: AtomicU64::new(entry_count),
-        file_count: AtomicU64::new(file_count),
-        directory_count: AtomicU64::new(directory_count),
+        size_bytes: path_info.size_bytes,
+        size_allocated_bytes: path_info.size_allocated_bytes,
+        entry_count: entry_count,
+        file_count: file_count,
+        directory_count: directory_count,
         last_modified_time: path_info.times.0 as u64,
         owner_name: path_info.owner_name,
       });
@@ -194,11 +193,11 @@ fn calculate_size_sync(
 
       // Get analytics info for the child if it exists
       if let Some(child_analytics) = analytics_map.get(child_path) {
-        let child_size = child_analytics.size_bytes.load(Ordering::Relaxed);
-        let child_allocated_size = child_analytics.size_allocated_bytes.load(Ordering::Relaxed);
-        let child_entries = child_analytics.entry_count.load(Ordering::Relaxed);
-        let child_files = child_analytics.file_count.load(Ordering::Relaxed);
-        let child_dirs = child_analytics.directory_count.load(Ordering::Relaxed);
+        let child_size = child_analytics.size_bytes;
+        let child_allocated_size = child_analytics.size_allocated_bytes;
+        let child_entries = child_analytics.entry_count;
+        let child_files = child_analytics.file_count;
+        let child_dirs = child_analytics.directory_count;
 
         total_size += child_size;
         total_allocated_size += child_allocated_size;
@@ -218,22 +217,18 @@ fn calculate_size_sync(
       }
     }
 
-    // Update this directory's values atomically (all at once)
-    entry_analytics
-      .size_bytes
-      .store(total_size, Ordering::Relaxed);
-    entry_analytics
-      .size_allocated_bytes
-      .store(total_allocated_size, Ordering::Relaxed);
-    entry_analytics
-      .entry_count
-      .store(total_entries, Ordering::Relaxed);
-    entry_analytics
-      .file_count
-      .store(total_files, Ordering::Relaxed);
-    entry_analytics
-      .directory_count
-      .store(total_dirs, Ordering::Relaxed);
+    // Get a mutable reference to modify the Arc<AnalyticsInfo>
+    if let Some(mut analytics_ref) = analytics_map.get_mut(&path.to_path_buf()) {
+      // Access and modify the inner AnalyticsInfo fields
+      let analytics = Arc::make_mut(&mut analytics_ref);
+
+      // Update this directory's values
+      analytics.size_bytes = total_size;
+      analytics.size_allocated_bytes = total_allocated_size;
+      analytics.entry_count = total_entries;
+      analytics.file_count = total_files;
+      analytics.directory_count = total_dirs;
+    }
   }
 
   Ok(())
@@ -249,11 +244,11 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
 
       FileSystemEntry {
         path: path.clone(),
-        size_bytes: analytics.size_bytes.load(Ordering::Relaxed),
-        size_allocated_bytes: analytics.size_allocated_bytes.load(Ordering::Relaxed),
-        entry_count: analytics.entry_count.load(Ordering::Relaxed),
-        file_count: analytics.file_count.load(Ordering::Relaxed),
-        directory_count: analytics.directory_count.load(Ordering::Relaxed),
+        size_bytes: analytics.size_bytes,
+        size_allocated_bytes: analytics.size_allocated_bytes,
+        entry_count: analytics.entry_count,
+        file_count: analytics.file_count,
+        directory_count: analytics.directory_count,
         last_modified_time: analytics.last_modified_time as u64,
         owner_name: analytics.owner_name.clone(),
       }
@@ -807,30 +802,21 @@ mod tests {
     // Directories have different size behaviors on different platforms
     #[cfg(target_family = "unix")]
     assert!(
-      analytics.size_bytes.load(Ordering::Relaxed) > 0,
+      analytics.size_bytes > 0,
       "Directory should have a size on Unix filesystems"
     );
 
     // On Windows, empty directories might report a size of 0
     #[cfg(target_os = "windows")]
     assert!(
-      analytics.size_bytes.load(Ordering::Relaxed) >= 0,
+      analytics.size_bytes >= 0,
       "Directory size might be 0 on Windows"
     );
 
+    assert_eq!(analytics.entry_count, 1, "Should count itself as one entry");
+    assert_eq!(analytics.file_count, 0, "Should have 0 files");
     assert_eq!(
-      analytics.entry_count.load(Ordering::Relaxed),
-      1,
-      "Should count itself as one entry"
-    );
-    assert_eq!(
-      analytics.file_count.load(Ordering::Relaxed),
-      0,
-      "Should have 0 files"
-    );
-    assert_eq!(
-      analytics.directory_count.load(Ordering::Relaxed),
-      1,
+      analytics.directory_count, 1,
       "Should count itself as one directory"
     );
 
@@ -871,22 +857,13 @@ mod tests {
 
     let analytics = analytics_map.get(&path).unwrap();
     assert!(
-      analytics.size_bytes.load(Ordering::Relaxed) >= test_data.len() as u64,
+      analytics.size_bytes >= test_data.len() as u64,
       "Directory size should include the file size"
     );
+    assert_eq!(analytics.entry_count, 2, "Should count itself and one file");
+    assert_eq!(analytics.file_count, 1, "Should have 1 file");
     assert_eq!(
-      analytics.entry_count.load(Ordering::Relaxed),
-      2,
-      "Should count itself and one file"
-    );
-    assert_eq!(
-      analytics.file_count.load(Ordering::Relaxed),
-      1,
-      "Should have 1 file"
-    );
-    assert_eq!(
-      analytics.directory_count.load(Ordering::Relaxed),
-      1,
+      analytics.directory_count, 1,
       "Should count itself as one directory"
     );
 
@@ -938,22 +915,16 @@ mod tests {
     let root_analytics = analytics_map.get(&path).unwrap();
     let expected_size = (test_data.len() + root_test_data.len()) as u64;
     assert!(
-      root_analytics.size_bytes.load(Ordering::Relaxed) >= expected_size,
+      root_analytics.size_bytes >= expected_size,
       "Directory size should include all files and subdirectories"
     );
     assert_eq!(
-      root_analytics.entry_count.load(Ordering::Relaxed),
-      4,
+      root_analytics.entry_count, 4,
       "Should count root dir, subdir, and 2 files"
     );
+    assert_eq!(root_analytics.file_count, 2, "Should have 2 files");
     assert_eq!(
-      root_analytics.file_count.load(Ordering::Relaxed),
-      2,
-      "Should have 2 files"
-    );
-    assert_eq!(
-      root_analytics.directory_count.load(Ordering::Relaxed),
-      2,
+      root_analytics.directory_count, 2,
       "Should count root and subdirectory"
     );
 
@@ -965,22 +936,16 @@ mod tests {
 
     let subdir_analytics = analytics_map.get(&subdir_path).unwrap();
     assert!(
-      subdir_analytics.size_bytes.load(Ordering::Relaxed) >= test_data.len() as u64,
+      subdir_analytics.size_bytes >= test_data.len() as u64,
       "Subdirectory size should include its file size"
     );
     assert_eq!(
-      subdir_analytics.entry_count.load(Ordering::Relaxed),
-      2,
+      subdir_analytics.entry_count, 2,
       "Should count subdir and its file"
     );
+    assert_eq!(subdir_analytics.file_count, 1, "Should have 1 file");
     assert_eq!(
-      subdir_analytics.file_count.load(Ordering::Relaxed),
-      1,
-      "Should have 1 file"
-    );
-    assert_eq!(
-      subdir_analytics.directory_count.load(Ordering::Relaxed),
-      1,
+      subdir_analytics.directory_count, 1,
       "Should count itself as one directory"
     );
 
@@ -1028,12 +993,11 @@ mod tests {
     // The symlink is counted in the entry count, but not as a file
     // In some implementations, symlinks might be treated differently
     assert!(
-      analytics.entry_count.load(Ordering::Relaxed) >= 2,
+      analytics.entry_count >= 2,
       "Should count at least the directory and file"
     );
     assert_eq!(
-      analytics.file_count.load(Ordering::Relaxed),
-      1,
+      analytics.file_count, 1,
       "Should count only the actual file, not the symlink as a file"
     );
 
