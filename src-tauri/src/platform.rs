@@ -4,6 +4,19 @@ use std::fs;
 use std::path::Path;
 
 use serde::Serialize;
+use dashmap::DashMap;
+use lazy_static::lazy_static;
+
+// Owner cache to avoid redundant lookups
+#[cfg(target_family = "unix")]
+lazy_static! {
+    static ref OWNER_CACHE: DashMap<u32, String> = DashMap::new();
+}
+
+#[cfg(target_os = "windows")]
+lazy_static! {
+    static ref OWNER_CACHE: DashMap<String, String> = DashMap::new();
+}
 
 #[cfg(target_family = "unix")]
 fn get_block_size() -> u64 {
@@ -330,10 +343,29 @@ fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Opt
   use users::get_user_by_uid;
 
   let uid = metadata.uid();
-  match get_user_by_uid(uid) {
-    Some(user) => Some(user.name().to_string_lossy().into_owned()),
-    None => Some(format!("<deleted user {}>", uid)), // More explicit format for deleted users
+  
+  // Check if the UID is already in the cache
+  if let Some(cached) = OWNER_CACHE.get(&uid) {
+    return Some(cached.clone());
   }
+  
+  // If not in cache, perform the lookup
+  let name = match get_user_by_uid(uid) {
+    Some(user) => {
+      let name = user.name().to_string_lossy().into_owned();
+      // Add to cache
+      OWNER_CACHE.insert(uid, name.clone());
+      Some(name)
+    },
+    None => {
+      let name = format!("<deleted user {}>", uid);
+      // Add to cache
+      OWNER_CACHE.insert(uid, name.clone());
+      Some(name)
+    },
+  };
+  
+  name
 }
 
 #[cfg(target_os = "windows")]
@@ -401,6 +433,43 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       return None;
     }
 
+    // Convert SID to string for cache key
+    let mut sid_string_ptr: winapi::um::winnt::LPWSTR = std::ptr::null_mut();
+    if winapi::um::sddl::ConvertSidToStringSidW(owner, &mut sid_string_ptr) == 0 {
+      eprintln!("ConvertSidToStringSidW failed");
+      return None;
+    }
+    
+    // Ensure proper cleanup of SID string
+    struct SidStrCleanup(*mut u16);
+    impl Drop for SidStrCleanup {
+      fn drop(&mut self) {
+        unsafe { LocalFree(self.0 as *mut c_void) };
+      }
+    }
+    let _sid_str_cleanup = SidStrCleanup(sid_string_ptr);
+    
+    // Convert to Rust string for cache key
+    let sid_string = {
+      let mut len = 0;
+      while unsafe { *sid_string_ptr.offset(len) } != 0 {
+        len += 1;
+      }
+      let slice = std::slice::from_raw_parts(sid_string_ptr, len as usize);
+      match OsString::from_wide(slice).into_string() {
+        Ok(s) => s,
+        Err(_) => {
+          eprintln!("Failed to convert SID to string");
+          return None;
+        }
+      }
+    };
+    
+    // Check cache first
+    if let Some(cached) = OWNER_CACHE.get(&sid_string) {
+      return Some(cached.clone());
+    }
+
     // Convert SID to name
     let mut name_size = 0;
     let mut domain_size = 0;
@@ -442,24 +511,35 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     }
 
     // Accept more SID types - not just users but also groups and aliases
-    match sid_type {
+    let name = match sid_type {
       t if t == SidTypeUser || t == SidTypeWellKnownGroup || t == SidTypeAlias => {
         // These are all valid owner types
         let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
         match name.into_string() {
-          Ok(name_str) => Some(name_str),
+          Ok(name_str) => {
+            // Add to cache
+            OWNER_CACHE.insert(sid_string, name_str.clone());
+            Some(name_str)
+          },
           Err(_) => {
             eprintln!("Failed to convert name to string");
             None
           }
         }
-      }
-      t if t == SidTypeDeletedAccount => Some("<deleted account>".to_string()),
+      },
+      t if t == SidTypeDeletedAccount => {
+        let name = "<deleted account>".to_string();
+        // Add to cache
+        OWNER_CACHE.insert(sid_string, name.clone());
+        Some(name)
+      },
       _ => {
         eprintln!("Unsupported SID type: {}", sid_type);
         None
       }
-    }
+    };
+    
+    name
   }
 }
 
