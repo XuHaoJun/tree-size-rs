@@ -374,6 +374,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
   use std::os::windows::ffi::{OsStrExt, OsStringExt};
   use winapi::ctypes::c_void;
   use winapi::shared::winerror::ERROR_SUCCESS;
+  use winapi::shared::sddl;
   use winapi::um::accctrl::SE_FILE_OBJECT;
   use winapi::um::aclapi::GetNamedSecurityInfoW;
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
@@ -435,7 +436,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
 
     // Convert SID to string for cache key
     let mut sid_string_ptr: winapi::um::winnt::LPWSTR = std::ptr::null_mut();
-    if winapi::um::sddl::ConvertSidToStringSidW(owner, &mut sid_string_ptr) == 0 {
+    if sddl::ConvertSidToStringSidW(owner, &mut sid_string_ptr) == 0 {
       eprintln!("ConvertSidToStringSidW failed");
       return None;
     }
