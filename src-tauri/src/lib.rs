@@ -25,7 +25,7 @@ struct AnalyticsInfo {
   /// Number of directories
   directory_count: AtomicU64,
   /// Last modified time (Unix timestamp in seconds)
-  last_modified_time: AtomicU64,
+  last_modified_time: u64,
   /// Owner of the file or directory
   owner_name: Option<String>,
 }
@@ -137,7 +137,7 @@ fn calculate_size_sync(
         entry_count: AtomicU64::new(entry_count),
         file_count: AtomicU64::new(file_count),
         directory_count: AtomicU64::new(directory_count),
-        last_modified_time: AtomicU64::new(path_info.times.0 as u64),
+        last_modified_time: path_info.times.0 as u64,
         owner_name: path_info.owner_name,
       });
       e.insert(analytics.clone());
@@ -254,7 +254,7 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         entry_count: analytics.entry_count.load(Ordering::Relaxed),
         file_count: analytics.file_count.load(Ordering::Relaxed),
         directory_count: analytics.directory_count.load(Ordering::Relaxed),
-        last_modified_time: analytics.last_modified_time.load(Ordering::Relaxed) as u64,
+        last_modified_time: analytics.last_modified_time as u64,
         owner_name: analytics.owner_name.clone(),
       }
     })
