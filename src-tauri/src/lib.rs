@@ -273,12 +273,12 @@ fn calculate_size_ntfs(
   }
 
   // Group entries by parent path
-  let mut parent_to_children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-  for (entry_path, _) in &entries {
+  let parent_to_children: DashMap<PathBuf, Vec<PathBuf>> = DashMap::new();
+  entries.par_iter().for_each(|(entry_path, _)| {
     if let Some(parent) = entry_path.parent().map(|p| p.to_path_buf()) {
-      parent_to_children.entry(parent).or_default().push(entry_path.clone());
+      parent_to_children.entry(parent).or_insert_with(Vec::new).push(entry_path.clone());
     }
-  }
+  });
 
   // Sort entries by path depth, deepest first
   let mut sorted_entries = entries.iter().collect::<Vec<_>>();
@@ -286,9 +286,8 @@ fn calculate_size_ntfs(
     std::cmp::Reverse(path.components().count())
   });
 
-  // First, add all entries to the analytics map
-  for (entry_path, file_info) in &entries {
-    println!("entry_path: {:?}", entry_path);
+  // First, add all entries to the analytics map in parallel
+  entries.par_iter().for_each(|(entry_path, file_info)| {
     let entry_count = 1;
     let file_count = if file_info.is_directory { 0 } else { 1 };
     let directory_count = if file_info.is_directory { 1 } else { 0 };
@@ -324,10 +323,10 @@ fn calculate_size_ntfs(
         owner_name,
       }),
     }));
-  }
+  });
 
-  // Then proceed with the aggregation phase...
-  // Process entries in order (deepest first)
+  // The aggregation phase needs to respect the directory hierarchy (deepest first)
+  // Process directories in descending order of depth
   for (entry_path, file_info) in sorted_entries {
     if file_info.is_directory {
       let mut total_size = file_info.size;
@@ -336,15 +335,50 @@ fn calculate_size_ntfs(
       let mut total_files = 0;
       let mut total_dirs = 1; // Count this directory
       
-      // Sum up children
+      // Sum up children using parallel reduction if there are enough children
       if let Some(children) = parent_to_children.get(entry_path) {
-        for child_path in children {
-          if let Some(child_analytics) = analytics_map.get(child_path) {
-            total_size += child_analytics.size_bytes;
-            total_allocated += child_analytics.size_allocated_bytes;
-            total_entries += child_analytics.entry_count;
-            total_files += child_analytics.file_count;
-            total_dirs += child_analytics.directory_count;
+        let children_vec = children.value().clone();
+        
+        if children_vec.len() > 10 {
+          // Parallel reduction for larger directories
+          let (size, allocated, entries, files, dirs) = children_vec.par_iter()
+            .filter_map(|child_path| analytics_map.get(child_path).map(|a| a.clone()))
+            .fold(
+              || (0, 0, 0, 0, 0),
+              |(s, a, e, f, d), child_analytics| (
+                s + child_analytics.size_bytes,
+                a + child_analytics.size_allocated_bytes,
+                e + child_analytics.entry_count,
+                f + child_analytics.file_count,
+                d + child_analytics.directory_count,
+              )
+            )
+            .reduce(
+              || (0, 0, 0, 0, 0),
+              |(s1, a1, e1, f1, d1), (s2, a2, e2, f2, d2)| (
+                s1 + s2,
+                a1 + a2,
+                e1 + e2,
+                f1 + f2,
+                d1 + d2,
+              )
+            );
+            
+          total_size += size;
+          total_allocated += allocated;
+          total_entries += entries;
+          total_files += files;
+          total_dirs += dirs;
+        } else {
+          // Sequential approach for smaller directories
+          for child_path in children_vec {
+            if let Some(child_analytics) = analytics_map.get(&child_path) {
+              total_size += child_analytics.size_bytes;
+              total_allocated += child_analytics.size_allocated_bytes;
+              total_entries += child_analytics.entry_count;
+              total_files += child_analytics.file_count;
+              total_dirs += child_analytics.directory_count;
+            }
           }
         }
       }
