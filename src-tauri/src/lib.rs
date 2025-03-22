@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::Emitter;
 
+#[cfg(target_os = "windows")]
+use ntfs_reader;
+
 /// Contains analytics information for a directory or file
 #[derive(Debug, Clone)]
 struct AnalyticsInfo {
@@ -94,7 +97,210 @@ struct DirectoryScanResult {
   scan_time_ms: u64,
 }
 
-// Efficient sync function that uses Rayon for parallel processing
+#[cfg(target_os = "windows")]
+fn calculate_size_sync(
+  path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+  target_dir_path: &Path,
+  visited_inodes: Arc<DashSet<(u64, u64)>>,
+  processed_paths: Arc<DashSet<PathBuf>>,
+) -> std::io::Result<()> {
+  use std::ffi::OsStr;
+  
+  // If we've already processed this path, skip it
+  if !processed_paths.insert(path.to_path_buf()) {
+    return Ok(());
+  }
+  
+  // Try to detect if the volume is NTFS
+  let is_ntfs = if let Some(root_path) = path.ancestors().find(|p| {
+    // Find the closest volume root (e.g., C:\)
+    if let Some(root) = p.components().next() {
+      // Check if this is a root directory (like "C:")
+      if let std::path::Component::Prefix(prefix) = root {
+        // For Windows, check if this is a disk prefix (like "C:")
+        if let std::path::Prefix::Disk(_) = prefix.kind() {
+          return true;
+        }
+      }
+    }
+    false
+  }) {
+    // Convert to string representation for the volume
+    if let Some(root_str) = root_path.to_str() {
+      // Try to open as NTFS volume, e.g., "C:\"
+      let volume_path = format!("{}\\", root_str);
+      match ntfs_reader::volume::Volume::new(&volume_path) {
+        Ok(_) => true,
+        Err(_) => false,
+      }
+    } else {
+      false
+    }
+  } else {
+    false
+  };
+
+  // Use NTFS-specific code path if it's an NTFS volume
+  if is_ntfs {
+    return calculate_size_ntfs(path, analytics_map, target_dir_path, visited_inodes, processed_paths);
+  }
+  
+  // Fallback to traditional method if not NTFS or if NTFS reading fails
+  calculate_size_sync(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
+}
+
+#[cfg(target_os = "windows")]
+fn calculate_size_ntfs(
+  path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+  target_dir_path: &Path,
+  visited_inodes: Arc<DashSet<(u64, u64)>>,
+  processed_paths: Arc<DashSet<PathBuf>>,
+) -> std::io::Result<()> {
+  // Get the volume root from the path
+  let volume_root = path.ancestors()
+    .find(|p| {
+      if let Some(root) = p.components().next() {
+        if let std::path::Component::Prefix(prefix) = root {
+          if let std::path::Prefix::Disk(_) = prefix.kind() {
+            return true;
+          }
+        }
+      }
+      false
+    })
+    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Unable to determine volume root"))?;
+  
+  // Convert to string representation for the volume
+  let volume_path = format!("{}\\", volume_root.to_str().ok_or_else(|| {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "Unable to convert volume path to string")
+  })?);
+  
+  // Open the NTFS volume
+  let volume = match ntfs_reader::volume::Volume::new(&volume_path) {
+    Ok(vol) => vol,
+    Err(e) => {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::Other, 
+        format!("Failed to open NTFS volume: {:?}", e)
+      ));
+    }
+  };
+  
+  // Create the MFT reader
+  let mft = match ntfs_reader::mft::Mft::new(volume) {
+    Ok(mft) => mft,
+    Err(e) => {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::Other, 
+        format!("Failed to read MFT: {:?}", e)
+      ));
+    }
+  };
+  
+  // Create a cache for paths
+  let mut cache = ntfs_reader::file_info::HashMapCache::default();
+  
+  // Process the root path first
+  let relative_to_root = if path == volume_root {
+    PathBuf::new()
+  } else {
+    path.strip_prefix(volume_root)
+      .map(|p| p.to_path_buf())
+      .unwrap_or_else(|_| {
+        // If strip_prefix fails, try to get a relative path representation another way
+        if let (Some(path_str), Some(volume_str)) = (path.to_str(), volume_root.to_str()) {
+          if path_str.starts_with(volume_str) {
+            let relative = &path_str[volume_str.len()..];
+            let relative = relative.trim_start_matches(['/', '\\']);
+            return PathBuf::from(relative);
+          }
+        }
+        PathBuf::new()
+      })
+  };
+  
+  // Gather all files recursively using MFT
+  let mut entries = Vec::new();
+  
+  // Iterate through all MFT records
+  mft.iterate_files(|file| {
+    // Get file info with path computation
+    let file_info = ntfs_reader::file_info::FileInfo::with_cache(&mft, file, &mut cache);
+    
+    // Check if this file is within our target directory
+    if file_info.path.starts_with(&relative_to_root) || file_info.path == relative_to_root {
+      // Reconstruct the full path
+      let full_path = if relative_to_root.as_os_str().is_empty() {
+        // If we're scanning the root, use volume_root + file path
+        volume_root.join(&file_info.path)
+      } else {
+        // Otherwise reconstruct from volume root + relative target path + relative file path
+        let file_rel_to_target = file_info.path.strip_prefix(&relative_to_root)
+          .map(|p| p.to_path_buf())
+          .unwrap_or_else(|_| file_info.path.clone());
+        path.join(file_rel_to_target)
+      };
+      
+      entries.push((full_path, file_info));
+    }
+  });
+  
+  // Now process all the gathered entries
+  for (entry_path, file_info) in entries {
+    // Compute a synthetic inode value based on position in MFT
+    // This helps prevent duplicate processing with the traditional method
+    let synthetic_inode = (0, file_info.size);
+    
+    // Skip if we've seen this "inode" before
+    if !visited_inodes.insert(synthetic_inode) {
+      continue;
+    }
+    
+    // Use the file information to create the analytics entry
+    let entry_count = 1;
+    let file_count = if file_info.is_directory { 0 } else { 1 };
+    let directory_count = if file_info.is_directory { 1 } else { 0 };
+    let last_modified_time = file_info.modified
+      .map(|t| t.unix_timestamp() as u64)
+      .unwrap_or(0);
+    
+    // On NTFS, the allocated size might be different from the logical size
+    let size_bytes = file_info.size;
+    // Approximate the allocated size (round up to nearest cluster, typically 4KB)
+    let size_allocated_bytes = (size_bytes + 4095) & !4095;
+    
+    // Create/update analytics entry
+    let entry_analytics = match analytics_map.entry(entry_path.clone()) {
+      dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
+      dashmap::mapref::entry::Entry::Vacant(e) => {
+        let analytics = Arc::new(AnalyticsInfo {
+          size_bytes,
+          size_allocated_bytes,
+          entry_count,
+          file_count,
+          directory_count,
+          last_modified_time,
+          owner_name: None, // We could retrieve this, but omitting for simplicity
+          path_info: Some(platform::PathInfo {
+            is_dir: file_info.is_directory,
+            size_bytes,
+            size_allocated_bytes,
+            inode_device: Some(synthetic_inode),
+            times: (last_modified_time as i64, 0, 0), // Using modified time for last mod
+            owner_name: None,
+          }),
+        });
+        e.insert(analytics.clone());
+        analytics
+      }
+    };
+  }
+  
+  Ok(())
+}
+
 fn calculate_size_sync(
   path: &Path,
   analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
@@ -335,7 +541,7 @@ fn build_tree_from_entries_with_depth(
     // Get children for this path if we haven't reached max depth
     let mut children = Vec::new();
     if current_depth < max_depth {
-      if let Some(child_paths) = children_map.get(&entry.path) {
+      if let Some(child_paths) = children_map.get(path) {
         for child_path in child_paths {
           if let Some(child_entry) = path_map.get(child_path) {
             let child_node = build_node(
