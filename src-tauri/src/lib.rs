@@ -147,7 +147,7 @@ fn calculate_size_sync(
   }
   
   // Fallback to traditional method if not NTFS or if NTFS reading fails
-  calculate_size_sync(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
+  super::calculate_size_sync(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
 }
 
 #[cfg(target_os = "windows")]
@@ -285,6 +285,8 @@ fn calculate_size_ntfs(
           owner_name: None, // We could retrieve this, but omitting for simplicity
           path_info: Some(platform::PathInfo {
             is_dir: file_info.is_directory,
+            is_file: !file_info.is_directory,
+            is_symlink: false, // NTFS reader doesn't directly expose symlink info, assuming false
             size_bytes,
             size_allocated_bytes,
             inode_device: Some(synthetic_inode),
