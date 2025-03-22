@@ -62,6 +62,7 @@ interface FileSystemTreeNode {
   last_modified_time: number
   owner_name: string | null
   children: FileSystemTreeNode[]
+  is_virtual_directory: boolean
 }
 
 interface DirectoryScanResult {
@@ -323,7 +324,12 @@ export function DirectoryScanner() {
     return {
       id: node.path,
       name: node.name,
-      type: node.directory_count > 0 ? "directory" : "file",
+      type:
+        node.directory_count > 0
+          ? "directory"
+          : node.is_virtual_directory
+            ? "virtual_directory"
+            : "file",
       sizeBytes: node.size_bytes,
       entryCount: node.entry_count,
       allocatedBytes: node.size_allocated_bytes,
@@ -768,9 +774,13 @@ function TreeSizeView({
           <div
             className="p-1 flex items-center justify-center cursor-pointer"
             style={{ paddingLeft: `${item.nestingLevel * 16}px` }}
-            onClick={() => item.type === "directory" && onToggleExpand(item.id)}
+            onClick={() =>
+              (item.type === "directory" ||
+                item.type === "virtual_directory") &&
+              onToggleExpand(item.id)
+            }
           >
-            {item.type === "directory" &&
+            {(item.type === "directory" || item.type === "virtual_directory") &&
               (isLoading ? (
                 <LoaderIcon className="h-4 w-4 animate-spin" />
               ) : isExpanded ? (

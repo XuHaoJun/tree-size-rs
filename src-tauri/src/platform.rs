@@ -3,6 +3,8 @@ use std::fs;
 
 use std::path::Path;
 
+use serde::Serialize;
+
 #[cfg(target_family = "unix")]
 fn get_block_size() -> u64 {
   // All os specific implementations of MetadataExt seem to define a block as 512 bytes
@@ -14,6 +16,7 @@ type InodeAndDevice = (u64, u64);
 type FileTime = (i64, i64, i64);
 
 /// Represents complete information about a filesystem path
+#[derive(Debug, Clone, Serialize)]
 pub struct PathInfo {
   /// Size in bytes
   pub size_bytes: u64,

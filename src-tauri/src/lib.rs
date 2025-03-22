@@ -2,6 +2,7 @@ mod platform;
 
 use dashmap::{DashMap, DashSet};
 use lazy_static::lazy_static;
+use platform::PathInfo;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,6 +28,8 @@ struct AnalyticsInfo {
   last_modified_time: u64,
   /// Owner of the file or directory
   owner_name: Option<String>,
+  /// Path info
+  path_info: Option<PathInfo>,
 }
 
 /// Represents size information for a file or directory
@@ -48,6 +51,8 @@ struct FileSystemEntry {
   last_modified_time: u64,
   /// Owner of the file or directory
   owner_name: Option<String>,
+  /// Path info
+  path_info: Option<PathInfo>,
 }
 
 /// Represents a node in the file system tree
@@ -75,6 +80,7 @@ struct FileSystemTreeNode {
   owner_name: Option<String>,
   /// Child nodes
   children: Vec<FileSystemTreeNode>,
+  is_virtual_directory: bool,
 }
 
 /// Complete scan result with tree representation
@@ -92,7 +98,7 @@ struct DirectoryScanResult {
 fn calculate_size_sync(
   path: &Path,
   analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
-  target_dir_path: Option<&Path>,
+  target_dir_path: &Path,
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
@@ -137,7 +143,8 @@ fn calculate_size_sync(
         file_count: file_count,
         directory_count: directory_count,
         last_modified_time: path_info.times.0 as u64,
-        owner_name: path_info.owner_name,
+        owner_name: path_info.owner_name.clone(),
+        path_info: Some(path_info.clone()),
       });
       e.insert(analytics.clone());
       analytics
@@ -165,7 +172,7 @@ fn calculate_size_sync(
       let _ = calculate_size_sync(
         child_path,
         analytics_map.clone(),
-        target_dir_path.clone(),
+        target_dir_path,
         visited_inodes.clone(),
         processed_paths.clone(),
       );
@@ -251,6 +258,7 @@ fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<F
         directory_count: analytics.directory_count,
         last_modified_time: analytics.last_modified_time as u64,
         owner_name: analytics.owner_name.clone(),
+        path_info: analytics.path_info.clone(),
       }
     })
     .collect()
@@ -261,6 +269,19 @@ fn build_tree_from_entries_with_depth(
   entries: &[FileSystemEntry],
   root_path: &Path,
   max_depth: usize,
+  // Whether to build a virtual directory node for the root path
+  // that contains all the children(files, no any dirs) of the root path
+  // it is just a analytics node, not a real node in the file system
+  // for example:
+  // root_path: /Users/username/Documents
+  // /Users/username/Documents/file1.txt
+  // /Users/username/Documents/file2.txt
+  // /Users/username/Documents/file3.txt
+  // /Users/username/Documents/subdir/
+  // will be a virtual directory node with 3 children file1, file2, file3
+  // and will move file1, file2, file3 to the children of the virtual directory node
+  // should total size of the virtual directory node is the sum of the size of file1, file2, file3
+  build_virtual_directory_node: bool,
 ) -> FileSystemTreeNode {
   // Create a map of path -> entry for quick lookups
   let path_map: HashMap<PathBuf, &FileSystemEntry> = entries
@@ -356,18 +377,139 @@ fn build_tree_from_entries_with_depth(
       last_modified_time: entry.last_modified_time,
       owner_name: entry.owner_name.clone(),
       children,
+      is_virtual_directory: false,
     }
   }
 
-  // Build the tree starting from the root with depth limit
-  build_node(
+  // If we're not building a virtual directory node, build the tree normally
+  // not build a virtual directory node if no files in the root path
+  if !build_virtual_directory_node || (build_virtual_directory_node && root_entry.file_count == 0) {
+    // Build the tree starting from the root with depth limit
+    return build_node(
+      &root_entry.path,
+      root_entry,
+      &children_map,
+      &path_map,
+      0,
+      max_depth,
+    );
+  }
+
+  // Building a virtual directory node
+  // First, get all direct children of the root path
+  let mut virtual_dir_children = Vec::new();
+  let mut virtual_dir_size_bytes = 0;
+  let mut virtual_dir_size_allocated_bytes = 0;
+  let mut virtual_dir_entry_count = 0;
+  let mut virtual_dir_file_count = 0;
+
+  if let Some(child_paths) = children_map.get(&root_entry.path) {
+    for child_path in child_paths {
+      if let Some(child_entry) = path_map.get(child_path) {
+        // Only include files (not directories) in the virtual directory
+        if child_entry.file_count > 0 && child_entry.directory_count == 0 {
+          // Create a tree node for this file
+          let child_node = build_node(
+            child_path,
+            child_entry,
+            &children_map,
+            &path_map,
+            0,
+            0, // No children for files
+          );
+
+          // Update virtual directory stats
+          virtual_dir_size_bytes += child_entry.size_bytes;
+          virtual_dir_size_allocated_bytes += child_entry.size_allocated_bytes;
+          virtual_dir_entry_count += 1;
+          virtual_dir_file_count += 1;
+
+          virtual_dir_children.push(child_node);
+        }
+      }
+    }
+  }
+
+  // Sort virtual directory children by size (largest first)
+  virtual_dir_children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+  // Calculate percentages for virtual directory children
+  for child in &mut virtual_dir_children {
+    if virtual_dir_size_bytes > 0 {
+      child.percent_of_parent = (child.size_bytes as f64 / virtual_dir_size_bytes as f64) * 100.0;
+    } else {
+      child.percent_of_parent = 0.0;
+    }
+  }
+
+  // Create the virtual directory node
+  // Extract the root directory name and append "Files" to it
+  let root_name = root_entry
+    .path
+    .file_name()
+    .and_then(|n| n.to_str())
+    .unwrap_or("unknown");
+  let virtual_dir_name = format!("{} Files", root_name);
+
+  // Create a path for the virtual directory by appending the virtual directory name to parent path
+  let virtual_dir_path = if let Some(parent) = root_entry.path.parent() {
+    parent.join(&virtual_dir_name)
+  } else {
+    PathBuf::from(&virtual_dir_name)
+  };
+
+  let virtual_display_name = format!("[{} Files]", virtual_dir_file_count);
+
+  let virtual_dir_node = FileSystemTreeNode {
+    path: virtual_dir_path,
+    name: virtual_display_name,
+    size_bytes: virtual_dir_size_bytes,
+    size_allocated_bytes: virtual_dir_size_allocated_bytes,
+    entry_count: virtual_dir_entry_count,
+    file_count: virtual_dir_file_count,
+    directory_count: 0, // Virtual directory is not a real directory
+    percent_of_parent: if root_entry.size_bytes > 0 {
+      (virtual_dir_size_bytes as f64 / root_entry.size_bytes as f64) * 100.0
+    } else {
+      0.0
+    },
+    last_modified_time: root_entry.last_modified_time,
+    owner_name: root_entry.owner_name.clone(),
+    children: virtual_dir_children,
+    is_virtual_directory: true,
+  };
+
+  // Now build the main tree but exclude the files that are in the virtual directory
+  let mut main_tree = build_node(
     &root_entry.path,
     root_entry,
     &children_map,
     &path_map,
     0,
     max_depth,
-  )
+  );
+
+  // Filter the main tree's children to remove files (they're now in the virtual directory)
+  main_tree.children.retain(|child| child.directory_count > 0);
+
+  // Add the virtual directory as a child of the main tree
+  main_tree.children.push(virtual_dir_node);
+
+  // Resort the main tree's children by size
+  main_tree
+    .children
+    .sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+  // Update percentages for all children
+  for child in &mut main_tree.children {
+    if main_tree.size_bytes > 0 {
+      child.percent_of_parent = (child.size_bytes as f64 / main_tree.size_bytes as f64) * 100.0;
+    } else {
+      child.percent_of_parent = 0.0;
+    }
+  }
+
+  main_tree
 }
 
 // This function builds a tree from prebuilt indices
@@ -377,6 +519,7 @@ fn build_tree_from_indices(
   children_map: &HashMap<PathBuf, Vec<usize>>,
   target_path: &Path,
   max_depth: usize,
+  build_virtual_directory_node: bool,
 ) -> Option<FileSystemTreeNode> {
   // Find the index of the target path
   let target_index = match path_map.get(target_path) {
@@ -431,6 +574,7 @@ fn build_tree_from_indices(
             last_modified_time: child_entry.last_modified_time,
             owner_name: child_entry.owner_name.clone(),
             children: Vec::new(), // No need to build children of children here
+            is_virtual_directory: false,
           };
 
           children.push(child_node);
@@ -452,21 +596,163 @@ fn build_tree_from_indices(
       last_modified_time: entry.last_modified_time,
       owner_name: entry.owner_name.clone(),
       children,
+      is_virtual_directory: false,
     }
   }
 
-  // Build the tree node
-  let children_indices = children_map.get(target_path);
-  let node = build_node(
+  // If not building a virtual directory node, just build the tree normally
+  // not build a virtual directory node if no files in the target path
+  if !build_virtual_directory_node || (build_virtual_directory_node && target_entry.file_count == 0)
+  {
+    // Build the tree node
+    let children_indices = children_map.get(target_path);
+    let node = build_node(
+      target_path,
+      target_entry,
+      entries,
+      children_indices,
+      0,
+      max_depth,
+    );
+
+    return Some(node);
+  }
+
+  // We're building a virtual directory node
+  // Get children indices for the target path
+  let children_indices = match children_map.get(target_path) {
+    Some(indices) => indices,
+    None => return None,
+  };
+
+  // Collect file and directory children separately
+  let mut file_indices = Vec::new();
+  let mut dir_indices = Vec::new();
+
+  for &idx in children_indices {
+    let child_entry = &entries[idx];
+    if child_entry.directory_count > 0 {
+      dir_indices.push(idx);
+    } else if child_entry.file_count > 0 {
+      file_indices.push(idx);
+    }
+  }
+
+  // First build the main tree node without the file children
+  let mut main_tree = build_node(
     target_path,
     target_entry,
     entries,
-    children_indices,
+    Some(&dir_indices),
     0,
     max_depth,
   );
 
-  Some(node)
+  // If we have files, create a virtual directory node for them
+  if !file_indices.is_empty() {
+    // Calculate virtual directory statistics
+    let mut virtual_dir_size_bytes = 0;
+    let mut virtual_dir_size_allocated_bytes = 0;
+    let virtual_dir_entry_count = file_indices.len() as u64;
+    let virtual_dir_file_count = file_indices.len() as u64;
+
+    // Create virtual directory children
+    let mut virtual_dir_children = Vec::with_capacity(file_indices.len());
+
+    for &idx in &file_indices {
+      let file_entry = &entries[idx];
+
+      // Create a node for each file
+      let file_node = FileSystemTreeNode {
+        path: file_entry.path.clone(),
+        name: file_entry
+          .path
+          .file_name()
+          .and_then(|n| n.to_str())
+          .unwrap_or("unknown")
+          .to_string(),
+        size_bytes: file_entry.size_bytes,
+        size_allocated_bytes: file_entry.size_allocated_bytes,
+        entry_count: file_entry.entry_count,
+        file_count: file_entry.file_count,
+        directory_count: 0,
+        percent_of_parent: 0.0, // Will be updated later
+        last_modified_time: file_entry.last_modified_time,
+        owner_name: file_entry.owner_name.clone(),
+        children: Vec::new(),
+        is_virtual_directory: false,
+      };
+
+      // Update virtual directory stats
+      virtual_dir_size_bytes += file_entry.size_bytes;
+      virtual_dir_size_allocated_bytes += file_entry.size_allocated_bytes;
+
+      virtual_dir_children.push(file_node);
+    }
+
+    // Sort virtual directory children by size (largest first)
+    virtual_dir_children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+    // Update percentages for virtual directory children
+    for child in &mut virtual_dir_children {
+      if virtual_dir_size_bytes > 0 {
+        child.percent_of_parent = (child.size_bytes as f64 / virtual_dir_size_bytes as f64) * 100.0;
+      }
+    }
+
+    // Extract the root directory name and append "Files" to it
+    let root_name = target_path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or("unknown");
+    let virtual_dir_name = format!("{} Files", root_name);
+
+    // Create a path for the virtual directory
+    let virtual_dir_path = if let Some(parent) = target_path.parent() {
+      parent.join(&virtual_dir_name)
+    } else {
+      PathBuf::from(&virtual_dir_name)
+    };
+
+    let virtual_display_name = format!("[{} Files]", virtual_dir_file_count);
+
+    // Create the virtual directory node
+    let virtual_dir_node = FileSystemTreeNode {
+      path: virtual_dir_path,
+      name: virtual_display_name,
+      size_bytes: virtual_dir_size_bytes,
+      size_allocated_bytes: virtual_dir_size_allocated_bytes,
+      entry_count: virtual_dir_entry_count,
+      file_count: virtual_dir_file_count,
+      directory_count: 0,
+      percent_of_parent: if main_tree.size_bytes > 0 {
+        (virtual_dir_size_bytes as f64 / main_tree.size_bytes as f64) * 100.0
+      } else {
+        0.0
+      },
+      last_modified_time: target_entry.last_modified_time,
+      owner_name: target_entry.owner_name.clone(),
+      children: virtual_dir_children,
+      is_virtual_directory: true,
+    };
+
+    // Add the virtual directory as a child of the main tree
+    main_tree.children.push(virtual_dir_node);
+
+    // Re-sort the main tree's children by size
+    main_tree
+      .children
+      .sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+    // Update percentages for all children
+    for child in &mut main_tree.children {
+      if main_tree.size_bytes > 0 {
+        child.percent_of_parent = (child.size_bytes as f64 / main_tree.size_bytes as f64) * 100.0;
+      }
+    }
+  }
+
+  Some(main_tree)
 }
 
 // Define a global cache to store scan results
@@ -526,7 +812,7 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     calculate_size_sync(
       target_dir_clone.as_path(),
       analytics_map_clone.clone(),
-      Some(target_dir_clone.as_path()),
+      target_dir_clone.as_path(),
       visited_inodes,
       processed_paths,
     )
@@ -546,7 +832,7 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
 
   // Build the initial tree from the entries with just a basic approach
   // This will be quick and allows us to show results to the user without waiting for indexing
-  let tree = build_tree_from_entries_with_depth(&entries, &target_dir, 1);
+  let tree = build_tree_from_entries_with_depth(&entries, &target_dir, 1, true);
 
   // Create the complete result object
   let result = DirectoryScanResult {
@@ -579,59 +865,7 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
     // Use tokio's spawn_blocking to run CPU-intensive parallelized work
     // This ensures we don't block the async runtime with CPU-bound work
     let indices_result = tokio::task::spawn_blocking(move || {
-      // Prebuild indices for faster tree building
-
-      // First pass: build path_map (map from path to index in entries) - parallelize this
-      let path_map = entries_for_indices
-        .par_iter()
-        .enumerate()
-        .map(|(i, entry)| (entry.path.clone(), i))
-        .collect::<HashMap<_, _>>();
-
-      // Second pass: build children_map
-      // This is harder to fully parallelize so we'll use a concurrent map
-      let children_map = DashMap::new();
-
-      // Populate the children map in parallel
-      entries_for_indices
-        .par_iter()
-        .enumerate()
-        .for_each(|(i, entry)| {
-          if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
-            // Skip entries that are outside our target directory
-            if !parent_path.starts_with(&target_dir_for_indices)
-              && parent_path != target_dir_for_indices
-            {
-              return;
-            }
-
-            // Use entry API on DashMap to safely add children indices
-            children_map
-              .entry(parent_path)
-              .or_insert_with(Vec::new)
-              .push(i);
-          }
-        });
-
-      // Convert DashMap to regular HashMap for storage
-      let mut regular_children_map: HashMap<PathBuf, Vec<usize>> =
-        HashMap::with_capacity(children_map.len());
-
-      // Third pass: collect and sort children by size (largest first) for each parent
-      children_map
-        .into_iter()
-        .for_each(|(parent_path, mut indices)| {
-          // Sort indices by size (largest first) - this can be done in parallel for each entry
-          indices.par_sort_unstable_by(|&a, &b| {
-            let size_a = entries_for_indices[a].size_bytes;
-            let size_b = entries_for_indices[b].size_bytes;
-            size_b.cmp(&size_a) // Sort largest first
-          });
-
-          regular_children_map.insert(parent_path, indices);
-        });
-
-      (path_map, regular_children_map)
+      build_indices(&entries_for_indices, &target_dir_for_indices)
     })
     .await;
 
@@ -657,6 +891,59 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
   });
 
   Ok(())
+}
+
+// Function to build indices for faster tree building
+fn build_indices(
+  entries: &[FileSystemEntry],
+  target_dir: &Path,
+) -> (HashMap<PathBuf, usize>, HashMap<PathBuf, Vec<usize>>) {
+  // First pass: build path_map (map from path to index in entries) - parallelize this
+  let path_map = entries
+    .par_iter()
+    .enumerate()
+    .map(|(i, entry)| (entry.path.clone(), i))
+    .collect::<HashMap<_, _>>();
+
+  // Second pass: build children_map
+  // This is harder to fully parallelize so we'll use a concurrent map
+  let children_map = DashMap::new();
+
+  // Populate the children map in parallel
+  entries.par_iter().enumerate().for_each(|(i, entry)| {
+    if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+      // Skip entries that are outside our target directory
+      if !parent_path.starts_with(target_dir) && parent_path != *target_dir {
+        return;
+      }
+
+      // Use entry API on DashMap to safely add children indices
+      children_map
+        .entry(parent_path)
+        .or_insert_with(Vec::new)
+        .push(i);
+    }
+  });
+
+  // Convert DashMap to regular HashMap for storage
+  let mut regular_children_map: HashMap<PathBuf, Vec<usize>> =
+    HashMap::with_capacity(children_map.len());
+
+  // Third pass: collect and sort children by size (largest first) for each parent
+  children_map
+    .into_iter()
+    .for_each(|(parent_path, mut indices)| {
+      // Sort indices by size (largest first) - this can be done in parallel for each entry
+      indices.par_sort_unstable_by(|&a, &b| {
+        let size_a = entries[a].size_bytes;
+        let size_b = entries[b].size_bytes;
+        size_b.cmp(&size_a) // Sort largest first
+      });
+
+      regular_children_map.insert(parent_path, indices);
+    });
+
+  (path_map, regular_children_map)
 }
 
 // Updated get_directory_children function to use cached data
@@ -690,7 +977,8 @@ async fn get_directory_children(path: String) -> Result<FileSystemTreeNode, Stri
       &cache.path_map,
       &cache.children_map,
       &target_dir,
-      1, // Just show direct children
+      1,    // Just show direct children
+      true, // Build virtual directory node
     ) {
       return Ok(tree);
     }
@@ -700,7 +988,7 @@ async fn get_directory_children(path: String) -> Result<FileSystemTreeNode, Stri
 
     if let Some(_) = entry {
       // Build a tree using the original method
-      let tree = build_tree_from_entries_with_depth(&cache.entries, &target_dir, 1);
+      let tree = build_tree_from_entries_with_depth(&cache.entries, &target_dir, 1, true);
       return Ok(tree);
     } else {
       return Err(format!(
@@ -787,7 +1075,7 @@ mod tests {
     calculate_size_sync(
       path.as_path(),
       analytics_map.clone(),
-      None, // No target directory
+      path.as_path(),
       visited_inodes,
       processed_paths,
     )?;
@@ -844,7 +1132,7 @@ mod tests {
     calculate_size_sync(
       path.as_path(),
       analytics_map.clone(),
-      None,
+      path.as_path(),
       visited_inodes,
       processed_paths,
     )?;
@@ -901,7 +1189,7 @@ mod tests {
     calculate_size_sync(
       path.as_path(),
       analytics_map.clone(),
-      None,
+      path.as_path(),
       visited_inodes,
       processed_paths,
     )?;
@@ -978,7 +1266,7 @@ mod tests {
     calculate_size_sync(
       path.as_path(),
       analytics_map.clone(),
-      None,
+      path.as_path(),
       visited_inodes,
       processed_paths,
     )?;
@@ -1029,7 +1317,7 @@ mod tests {
       calculate_size_sync(
         test_dir.as_path(),
         analytics_map.clone(),
-        None,
+        test_dir.as_path(),
         visited_inodes,
         processed_paths,
       )?;
@@ -1056,7 +1344,7 @@ mod tests {
         let _ = calculate_size_sync(
           test_dir.as_path(),
           analytics_map.clone(),
-          None,
+          test_dir.as_path(),
           visited_inodes,
           processed_paths,
         );
@@ -1109,7 +1397,7 @@ mod tests {
     calculate_size_sync(
       path.as_path(),
       analytics_map.clone(),
-      None,
+      path.as_path(),
       visited_inodes,
       processed_paths,
     )?;
@@ -1170,7 +1458,7 @@ mod tests {
     calculate_size_sync(
       path.as_path(),
       analytics_map.clone(),
-      None,
+      path.as_path(),
       visited_inodes,
       processed_paths,
     )?;
