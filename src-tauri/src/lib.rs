@@ -147,7 +147,7 @@ fn calculate_size_sync(
   }
   
   // Fallback to traditional method if not NTFS or if NTFS reading fails
-  super::calculate_size_sync(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
+  calculate_size_original(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
 }
 
 #[cfg(target_os = "windows")]
@@ -310,6 +310,16 @@ fn calculate_size_sync(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
+  calculate_size_original(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
+}
+
+fn calculate_size_original(
+  path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+  target_dir_path: &Path,
+  visited_inodes: Arc<DashSet<(u64, u64)>>,
+  processed_paths: Arc<DashSet<PathBuf>>,
+) -> std::io::Result<()> {
   // If we've already processed this path, skip it
   if !processed_paths.insert(path.to_path_buf()) {
     return Ok(());
@@ -377,7 +387,7 @@ fn calculate_size_sync(
 
     // Process all children in parallel using Rayon
     entries.par_iter().for_each(|child_path| {
-      let _ = calculate_size_sync(
+      let _ = calculate_size_original(
         child_path,
         analytics_map.clone(),
         target_dir_path,
@@ -1337,7 +1347,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     // Run the function
-    calculate_size_sync(
+    calculate_size_original(
       path.as_path(),
       analytics_map.clone(),
       path.as_path(),
@@ -1394,7 +1404,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     // Run the function
-    calculate_size_sync(
+    calculate_size_original(
       path.as_path(),
       analytics_map.clone(),
       path.as_path(),
@@ -1471,7 +1481,7 @@ mod tests {
     let processed_paths = Arc::new(DashSet::new());
 
     // Run the function
-    calculate_size_sync(
+    calculate_size_original(
       path.as_path(),
       analytics_map.clone(),
       path.as_path(),
@@ -1522,7 +1532,7 @@ mod tests {
       let processed_paths = Arc::new(DashSet::new());
 
       // Use Rayon's default thread pool (parallel)
-      calculate_size_sync(
+      calculate_size_original(
         test_dir.as_path(),
         analytics_map.clone(),
         test_dir.as_path(),
@@ -1549,7 +1559,7 @@ mod tests {
         .unwrap();
 
       pool.install(|| {
-        let _ = calculate_size_sync(
+        let _ = calculate_size_original(
           test_dir.as_path(),
           analytics_map.clone(),
           test_dir.as_path(),
@@ -1602,7 +1612,7 @@ mod tests {
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
 
-    calculate_size_sync(
+    calculate_size_original(
       path.as_path(),
       analytics_map.clone(),
       path.as_path(),
@@ -1663,7 +1673,7 @@ mod tests {
     let visited_inodes = Arc::new(DashSet::new());
     let processed_paths = Arc::new(DashSet::new());
 
-    calculate_size_sync(
+    calculate_size_original(
       path.as_path(),
       analytics_map.clone(),
       path.as_path(),
