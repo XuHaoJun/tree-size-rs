@@ -49,6 +49,7 @@ users = "0.11"
 winapi-util = "0.1"
 filesize = "0.2.0"
 winapi = { version = "0.3", features = ["winnt", "securitybaseapi", "accctrl", "aclapi", "sddl"] }
+ntfs-reader = "0.4.2"
 
 [dev-dependencies]
 tempfile = "3.10.1"
