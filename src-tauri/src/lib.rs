@@ -247,63 +247,85 @@ fn calculate_size_ntfs(
     }
   });
   
-  // Now process all the gathered entries
-  for (entry_path, file_info) in entries {
-    // Compute a synthetic inode value based on position in MFT
-    // This helps prevent duplicate processing with the traditional method
-    let synthetic_inode = (0, file_info.size);
-    
-    // Skip if we've seen this "inode" before
-    if !visited_inodes.insert(synthetic_inode) {
-      continue;
+  // After processing all the entries individually...
+
+  // Group entries by parent path
+  let mut parent_to_children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+  for (entry_path, _) in &entries {
+    if let Some(parent) = entry_path.parent().map(|p| p.to_path_buf()) {
+      parent_to_children.entry(parent).or_default().push(entry_path.clone());
     }
-    
-    // Use the file information to create the analytics entry
-    let entry_count = 1;
-    let file_count = if file_info.is_directory { 0 } else { 1 };
-    let directory_count = if file_info.is_directory { 1 } else { 0 };
-    let last_modified_time = file_info.modified
-      .map(|t| t.unix_timestamp() as u64)
-      .unwrap_or(0);
-    
-    // On NTFS, the allocated size might be different from the logical size
-    let size_bytes = file_info.size;
-    // Approximate the allocated size (round up to nearest cluster, typically 4KB)
-    let size_allocated_bytes = (size_bytes + 4095) & !4095;
-    
-    // Create/update analytics entry
-    let entry_analytics = match analytics_map.entry(entry_path.clone()) {
-      dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
-      dashmap::mapref::entry::Entry::Vacant(e) => {
-        let analytics = Arc::new(AnalyticsInfo {
-          size_bytes,
-          size_allocated_bytes,
-          entry_count,
-          file_count,
-          directory_count,
-          last_modified_time,
-          owner_name: None, // We could retrieve this, but omitting for simplicity
-          path_info: Some(platform::PathInfo {
-            is_dir: file_info.is_directory,
-            is_file: !file_info.is_directory,
-            is_symlink: false, // NTFS reader doesn't directly expose symlink info, assuming false
-            size_bytes,
-            size_allocated_bytes,
-            inode_device: Some(synthetic_inode),
-            times: (last_modified_time as i64, 0, 0), // Using modified time for last mod
-            owner_name: None,
-          }),
-        });
-        e.insert(analytics.clone());
-        analytics
+  }
+
+  // Sort entries by path depth, deepest first
+  let mut sorted_entries = entries.iter().collect::<Vec<_>>();
+  sorted_entries.sort_by_key(|(path, _)| {
+    std::cmp::Reverse(path.components().count())
+  });
+
+// First, add all entries to the analytics map
+for (entry_path, file_info) in &entries {
+  let entry_count = 1;
+  let file_count = if file_info.is_directory { 0 } else { 1 };
+  let directory_count = if file_info.is_directory { 1 } else { 0 };
+  let last_modified_time = file_info.modified
+    .map(|t| t.unix_timestamp() as u64)
+    .unwrap_or(0);
+  
+  let size_bytes = file_info.size;
+  let size_allocated_bytes = (size_bytes + 4095) & !4095;
+  
+  analytics_map.insert(entry_path.clone(), Arc::new(AnalyticsInfo {
+    size_bytes,
+    size_allocated_bytes,
+    entry_count,
+    file_count,
+    directory_count,
+    last_modified_time,
+    owner_name: None,
+    path_info: Some(platform::PathInfo {
+      is_dir: file_info.is_directory,
+      is_file: !file_info.is_directory,
+      is_symlink: false,
+      size_bytes,
+      size_allocated_bytes,
+      inode_device: Some((0, file_info.size)),
+      times: (last_modified_time as i64, 0, 0),
+      owner_name: None,
+    }),
+  }));
+}
+
+// Then proceed with the aggregation phase...
+
+  // Process entries in order (deepest first)
+  for (entry_path, file_info) in sorted_entries {
+    if file_info.is_directory {
+      let mut total_size = file_info.size;
+      let mut total_allocated = (total_size + 4095) & !4095;
+      
+      // Sum up children
+      if let Some(children) = parent_to_children.get(entry_path) {
+        for child_path in children {
+          if let Some(child_analytics) = analytics_map.get(child_path) {
+            total_size += child_analytics.size_bytes;
+            total_allocated += child_analytics.size_allocated_bytes;
+          }
+        }
       }
-    };
+      
+      // Update directory entry with totals
+      if let Some(mut dir_analytics) = analytics_map.get_mut(entry_path) {
+        let analytics = Arc::make_mut(&mut dir_analytics);
+        analytics.size_bytes = total_size;
+        analytics.size_allocated_bytes = total_allocated;
+      }
+    }
   }
   
   Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
 fn calculate_size_traditional(
   path: &Path,
   analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
@@ -451,6 +473,7 @@ fn calculate_size_traditional(
 }
 
 
+#[cfg(not(target_os = "windows"))]
 fn calculate_size_sync(
   path: &Path,
   analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
@@ -458,143 +481,7 @@ fn calculate_size_sync(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
-  // If we've already processed this path, skip it
-  if !processed_paths.insert(path.to_path_buf()) {
-    return Ok(());
-  }
-
-  // Get path info using our platform-agnostic function - will work for files, dirs and symlinks
-  let is_symlink = path.is_symlink();
-  let path_info = match platform::get_path_info(path, is_symlink) {
-    Some(info) => info,
-    None => return Ok(()),
-  };
-
-  // Check for cycles using device and inode numbers if available
-  // This handles both directory cycles AND symlinks properly
-  if let Some(inode_pair) = path_info.inode_device {
-    if !visited_inodes.insert(inode_pair) {
-      // We've already seen this inode, skip it
-      return Ok(());
-    }
-  }
-
-  // Count entry as file or directory, symlinks count as entries but not as files or dirs
-  let entry_count = 1; // Count this file/directory/symlink as 1 entry
-  let file_count = if path_info.is_dir || is_symlink { 0 } else { 1 };
-  let directory_count = if path_info.is_dir && !is_symlink {
-    1
-  } else {
-    0
-  };
-
-  // Add entry to analytics map with initial values (will be updated later for directories)
-  let entry_analytics = match analytics_map.entry(path.to_path_buf()) {
-    dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
-    dashmap::mapref::entry::Entry::Vacant(e) => {
-      let analytics = Arc::new(AnalyticsInfo {
-        size_bytes: path_info.size_bytes,
-        size_allocated_bytes: path_info.size_allocated_bytes,
-        entry_count: entry_count,
-        file_count: file_count,
-        directory_count: directory_count,
-        last_modified_time: path_info.times.0 as u64,
-        owner_name: path_info.owner_name.clone(),
-        path_info: Some(path_info.clone()),
-      });
-      e.insert(analytics.clone());
-      analytics
-    }
-  };
-
-  // For directories, process all children (but don't follow symlinks)
-  if path_info.is_dir && !is_symlink {
-    // Read directory entries
-    let entries = match std::fs::read_dir(&path) {
-      Ok(dir_entries) => {
-        let mut entry_paths = Vec::with_capacity(32); // Pre-allocate for common case
-        for entry_result in dir_entries {
-          if let Ok(entry) = entry_result {
-            entry_paths.push(entry.path());
-          }
-        }
-        entry_paths
-      }
-      Err(_) => Vec::new(),
-    };
-
-    // Process all children in parallel using Rayon
-    entries.par_iter().for_each(|child_path| {
-      let _ = calculate_size_sync(
-        child_path,
-        analytics_map.clone(),
-        target_dir_path,
-        visited_inodes.clone(),
-        processed_paths.clone(),
-      );
-    });
-
-    // Now compute the total size based on children
-    let dir_own_size = path_info.size_bytes; // Start with directory's own size
-    let dir_own_allocated_size = path_info.size_allocated_bytes; // Start with directory's own allocated size
-    let mut total_size = dir_own_size;
-    let mut total_allocated_size = dir_own_allocated_size;
-    let mut total_entries = 1; // Start with the directory itself
-    let mut total_files = 0; // Directories don't count as files
-    let mut total_dirs = 1; // Count this directory
-
-    // Sum up all children's contributions
-    for child_path in &entries {
-      // Check if the child is a direct file (not a symlink pointing to a file)
-      let child_is_file = child_path.is_file() && !child_path.is_symlink();
-
-      // Update counts for direct files first
-      if child_is_file {
-        total_files += 1;
-        total_entries += 1;
-      }
-
-      // Get analytics info for the child if it exists
-      if let Some(child_analytics) = analytics_map.get(child_path) {
-        let child_size = child_analytics.size_bytes;
-        let child_allocated_size = child_analytics.size_allocated_bytes;
-        let child_entries = child_analytics.entry_count;
-        let child_files = child_analytics.file_count;
-        let child_dirs = child_analytics.directory_count;
-
-        total_size += child_size;
-        total_allocated_size += child_allocated_size;
-
-        // For symlinks, count the entry but not as file/dir
-        if child_path.is_symlink() {
-          total_entries += 1; // Count the symlink as an entry
-        } else {
-          // For non-symlinks, add all the counts
-          if !child_is_file {
-            // Avoid double counting files we already counted
-            total_entries += child_entries;
-            total_files += child_files;
-          }
-          total_dirs += child_dirs;
-        }
-      }
-    }
-
-    // Get a mutable reference to modify the Arc<AnalyticsInfo>
-    if let Some(mut analytics_ref) = analytics_map.get_mut(&path.to_path_buf()) {
-      // Access and modify the inner AnalyticsInfo fields
-      let analytics = Arc::make_mut(&mut analytics_ref);
-
-      // Update this directory's values
-      analytics.size_bytes = total_size;
-      analytics.size_allocated_bytes = total_allocated_size;
-      analytics.entry_count = total_entries;
-      analytics.file_count = total_files;
-      analytics.directory_count = total_dirs;
-    }
-  }
-
-  Ok(())
+  calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
 }
 
 // This function converts the analytics map to a vector of FileSystemEntry objects
