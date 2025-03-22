@@ -467,3 +467,12 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
 fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Option<String> {
   None
 }
+
+/// Get the owner name for a path (convenience wrapper around get_owner_name)
+pub fn get_path_owner<P: AsRef<Path>>(path: P) -> Option<String> {
+  if let Ok(metadata) = std::fs::metadata(path.as_ref()) {
+    get_owner_name(path, &metadata)
+  } else {
+    None
+  }
+}

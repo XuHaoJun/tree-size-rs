@@ -143,7 +143,15 @@ fn calculate_size_sync(
 
   // Use NTFS-specific code path if it's an NTFS volume
   if is_ntfs {
-    return calculate_size_ntfs(path, analytics_map, target_dir_path, visited_inodes, processed_paths);
+    match calculate_size_ntfs(path, analytics_map.clone(), target_dir_path, visited_inodes.clone(), processed_paths.clone()) {
+      Ok(()) => return Ok(()),
+      Err(e) => {
+        eprintln!("NTFS reading failed, falling back to traditional method: {}", e);
+        // If NTFS-specific method fails, try the traditional method
+        // We need to make sure we reset the processed_paths entry so the traditional method processes this path
+        processed_paths.remove(path);
+      }
+    }
   }
   
   // Fallback to traditional method if not NTFS or if NTFS reading fails
@@ -247,7 +255,56 @@ fn calculate_size_ntfs(
     }
   });
   
-  // After processing all the entries individually...
+  // Make sure the target path itself is in the analytics map, even if not found in MFT
+  if !entries.iter().any(|(entry_path, _)| entry_path == path) {
+    // Get basic info about the directory using platform-specific functions
+    let path_info = platform::get_path_info(path, false);
+    
+    if let Some(info) = path_info {
+      analytics_map.insert(path.to_path_buf(), Arc::new(AnalyticsInfo {
+        size_bytes: info.size_bytes,
+        size_allocated_bytes: info.size_allocated_bytes,
+        entry_count: 1,
+        file_count: 0,
+        directory_count: 1,
+        last_modified_time: info.times.0 as u64,
+        owner_name: info.owner_name.clone(),
+        path_info: Some(info),
+      }));
+    } else {
+      // Fallback to basic metadata if platform-specific approach fails
+      if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.is_dir() {
+          let last_modified_time = metadata.modified()
+            .map(|time| time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
+            .unwrap_or(0);
+          
+          let size_bytes = 0; // Will be updated with children's sizes
+          let size_allocated_bytes = 0;
+          
+          analytics_map.insert(path.to_path_buf(), Arc::new(AnalyticsInfo {
+            size_bytes,
+            size_allocated_bytes,
+            entry_count: 1,
+            file_count: 0,
+            directory_count: 1,
+            last_modified_time,
+            owner_name: None,
+            path_info: Some(platform::PathInfo {
+              is_dir: true,
+              is_file: false,
+              is_symlink: false,
+              size_bytes,
+              size_allocated_bytes,
+              inode_device: None,
+              times: (last_modified_time as i64, 0, 0),
+              owner_name: None,
+            }),
+          }));
+        }
+      }
+    }
+  }
 
   // Group entries by parent path
   let mut parent_to_children: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -263,46 +320,51 @@ fn calculate_size_ntfs(
     std::cmp::Reverse(path.components().count())
   });
 
-// First, add all entries to the analytics map
-for (entry_path, file_info) in &entries {
-  let entry_count = 1;
-  let file_count = if file_info.is_directory { 0 } else { 1 };
-  let directory_count = if file_info.is_directory { 1 } else { 0 };
-  let last_modified_time = file_info.modified
-    .map(|t| t.unix_timestamp() as u64)
-    .unwrap_or(0);
-  
-  let size_bytes = file_info.size;
-  let size_allocated_bytes = (size_bytes + 4095) & !4095;
-  
-  analytics_map.insert(entry_path.clone(), Arc::new(AnalyticsInfo {
-    size_bytes,
-    size_allocated_bytes,
-    entry_count,
-    file_count,
-    directory_count,
-    last_modified_time,
-    owner_name: None,
-    path_info: Some(platform::PathInfo {
-      is_dir: file_info.is_directory,
-      is_file: !file_info.is_directory,
-      is_symlink: false,
+  // First, add all entries to the analytics map
+  for (entry_path, file_info) in &entries {
+    let entry_count = 1;
+    let file_count = if file_info.is_directory { 0 } else { 1 };
+    let directory_count = if file_info.is_directory { 1 } else { 0 };
+    let last_modified_time = file_info.modified
+      .map(|t| t.unix_timestamp() as u64)
+      .unwrap_or(0);
+    
+    let size_bytes = file_info.size;
+    let size_allocated_bytes = (size_bytes + 4095) & !4095;
+    
+    // Get owner information
+    let owner_name = platform::get_path_owner(entry_path);
+    
+    analytics_map.insert(entry_path.clone(), Arc::new(AnalyticsInfo {
       size_bytes,
       size_allocated_bytes,
-      inode_device: Some((0, file_info.size)),
-      times: (last_modified_time as i64, 0, 0),
-      owner_name: None,
-    }),
-  }));
-}
+      entry_count,
+      file_count,
+      directory_count,
+      last_modified_time,
+      owner_name: owner_name.clone(),
+      path_info: Some(platform::PathInfo {
+        is_dir: file_info.is_directory,
+        is_file: !file_info.is_directory,
+        is_symlink: false,
+        size_bytes,
+        size_allocated_bytes,
+        inode_device: Some((0, file_info.size)),
+        times: (last_modified_time as i64, 0, 0),
+        owner_name,
+      }),
+    }));
+  }
 
-// Then proceed with the aggregation phase...
-
+  // Then proceed with the aggregation phase...
   // Process entries in order (deepest first)
   for (entry_path, file_info) in sorted_entries {
     if file_info.is_directory {
       let mut total_size = file_info.size;
       let mut total_allocated = (total_size + 4095) & !4095;
+      let mut total_entries = 1; // Start with the directory itself
+      let mut total_files = 0;
+      let mut total_dirs = 1; // Count this directory
       
       // Sum up children
       if let Some(children) = parent_to_children.get(entry_path) {
@@ -310,6 +372,9 @@ for (entry_path, file_info) in &entries {
           if let Some(child_analytics) = analytics_map.get(child_path) {
             total_size += child_analytics.size_bytes;
             total_allocated += child_analytics.size_allocated_bytes;
+            total_entries += child_analytics.entry_count;
+            total_files += child_analytics.file_count;
+            total_dirs += child_analytics.directory_count;
           }
         }
       }
@@ -319,6 +384,9 @@ for (entry_path, file_info) in &entries {
         let analytics = Arc::make_mut(&mut dir_analytics);
         analytics.size_bytes = total_size;
         analytics.size_allocated_bytes = total_allocated;
+        analytics.entry_count = total_entries;
+        analytics.file_count = total_files;
+        analytics.directory_count = total_dirs;
       }
     }
   }
@@ -364,7 +432,7 @@ fn calculate_size_traditional(
   };
 
   // Add entry to analytics map with initial values (will be updated later for directories)
-  let entry_analytics = match analytics_map.entry(path.to_path_buf()) {
+  let _entry_analytics = match analytics_map.entry(path.to_path_buf()) {
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
