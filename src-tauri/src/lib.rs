@@ -106,6 +106,8 @@ fn calculate_size_sync(
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
   use std::ffi::OsStr;
+
+  println!("windows calculate_size_sync: {:?}", path);
   
   // If we've already processed this path, skip it
   if !processed_paths.insert(path.to_path_buf()) {
@@ -141,20 +143,20 @@ fn calculate_size_sync(
     false
   };
 
+  println!("is_ntfs: {}", is_ntfs);
   // Use NTFS-specific code path if it's an NTFS volume
   if is_ntfs {
+    // Store the current state of processed_paths for this path
     match calculate_size_ntfs(path, analytics_map.clone(), target_dir_path, visited_inodes.clone(), processed_paths.clone()) {
       Ok(()) => return Ok(()),
       Err(e) => {
         eprintln!("NTFS reading failed, falling back to traditional method: {}", e);
-        // If NTFS-specific method fails, try the traditional method
-        // We need to make sure we reset the processed_paths entry so the traditional method processes this path
-        processed_paths.remove(path);
       }
     }
   }
   
   // Fallback to traditional method if not NTFS or if NTFS reading fails
+  processed_paths.remove(path);
   calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
 }
 
@@ -166,6 +168,7 @@ fn calculate_size_ntfs(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
+  println!("windows calculate_size_ntfs: {:?}", path);
   // Get the volume root from the path
   let volume_root = path.ancestors()
     .find(|p| {
@@ -184,6 +187,8 @@ fn calculate_size_ntfs(
   let volume_path = format!("{}\\", volume_root.to_str().ok_or_else(|| {
     std::io::Error::new(std::io::ErrorKind::InvalidData, "Unable to convert volume path to string")
   })?);
+
+  println!("volume_path: {}", volume_path);
   
   // Open the NTFS volume
   let volume = match ntfs_reader::volume::Volume::new(&volume_path) {
@@ -283,6 +288,7 @@ fn calculate_size_ntfs(
 
   // First, add all entries to the analytics map
   for (entry_path, file_info) in &entries {
+    println!("entry_path: {:?}", entry_path);
     let entry_count = 1;
     let file_count = if file_info.is_directory { 0 } else { 1 };
     let directory_count = if file_info.is_directory { 1 } else { 0 };
@@ -295,6 +301,9 @@ fn calculate_size_ntfs(
     
     // Get owner information
     let owner_name = platform::get_path_owner(entry_path);
+    
+    // Ensure the processed_paths set is updated too
+    processed_paths.insert(entry_path.clone());
     
     analytics_map.insert(entry_path.clone(), Arc::new(AnalyticsInfo {
       size_bytes,
@@ -362,6 +371,7 @@ fn calculate_size_traditional(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
+  println!("calculate_size_traditional: {:?}", path);
   // If we've already processed this path, skip it
   if !processed_paths.insert(path.to_path_buf()) {
     return Ok(());
@@ -393,23 +403,16 @@ fn calculate_size_traditional(
   };
 
   // Add entry to analytics map with initial values (will be updated later for directories)
-  let _entry_analytics = match analytics_map.entry(path.to_path_buf()) {
-    dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
-    dashmap::mapref::entry::Entry::Vacant(e) => {
-      let analytics = Arc::new(AnalyticsInfo {
-        size_bytes: path_info.size_bytes,
-        size_allocated_bytes: path_info.size_allocated_bytes,
-        entry_count: entry_count,
-        file_count: file_count,
-        directory_count: directory_count,
-        last_modified_time: path_info.times.0 as u64,
-        owner_name: path_info.owner_name.clone(),
-        path_info: Some(path_info.clone()),
-      });
-      e.insert(analytics.clone());
-      analytics
-    }
-  };
+  analytics_map.insert(path.to_path_buf(), Arc::new(AnalyticsInfo {
+    size_bytes: path_info.size_bytes,
+    size_allocated_bytes: path_info.size_allocated_bytes,
+    entry_count: entry_count,
+    file_count: file_count,
+    directory_count: directory_count,
+    last_modified_time: path_info.times.0 as u64,
+    owner_name: path_info.owner_name.clone(),
+    path_info: Some(path_info.clone()),
+  }));
 
   // For directories, process all children (but don't follow symlinks)
   if path_info.is_dir && !is_symlink {
@@ -429,7 +432,7 @@ fn calculate_size_traditional(
 
     // Process all children in parallel using Rayon
     entries.par_iter().for_each(|child_path| {
-      let _ = calculate_size_sync(
+      let _ = calculate_size_traditional(
         child_path,
         analytics_map.clone(),
         target_dir_path,
@@ -1353,6 +1356,10 @@ mod tests {
     )?;
 
     // Verify the results
+    if !analytics_map.contains_key(&path) {
+      println!("path: {:?}", path);
+      println!("Analytics map keys: {:?}", analytics_map.iter().map(|item| item.key().clone()).collect::<Vec<_>>());
+    }
     assert!(
       analytics_map.contains_key(&path),
       "Path should be in the analytics map"
@@ -1410,6 +1417,10 @@ mod tests {
     )?;
 
     // Verify the results
+    if !analytics_map.contains_key(&path) {
+      println!("path: {:?}", path);
+      println!("Analytics map keys: {:?}", analytics_map.iter().map(|item| item.key().clone()).collect::<Vec<_>>());
+    }
     assert!(
       analytics_map.contains_key(&path),
       "Path should be in the analytics map"
@@ -1467,6 +1478,10 @@ mod tests {
     )?;
 
     // Verify the results for the root directory
+    if !analytics_map.contains_key(&path) {
+      println!("path: {:?}", path);
+      println!("Analytics map keys: {:?}", analytics_map.iter().map(|item| item.key().clone()).collect::<Vec<_>>());
+    }
     assert!(
       analytics_map.contains_key(&path),
       "Root path should be in the analytics map"
@@ -1544,6 +1559,10 @@ mod tests {
     )?;
 
     // Verify the results
+    if !analytics_map.contains_key(&path) {
+      println!("path: {:?}", path);
+      println!("Analytics map keys: {:?}", analytics_map.iter().map(|item| item.key().clone()).collect::<Vec<_>>());
+    }
     assert!(
       analytics_map.contains_key(&path),
       "Path should be in the analytics map"
