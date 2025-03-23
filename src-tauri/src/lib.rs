@@ -84,8 +84,6 @@ fn calculate_size_sync(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
-  use std::ffi::OsStr;
-
   println!("windows calculate_size_sync: {:?}", path);
   
   // If we've already processed this path, skip it
@@ -94,31 +92,53 @@ fn calculate_size_sync(
   }
   
   // Try to detect if the volume is NTFS
-  let is_ntfs = if let Some(root_path) = path.ancestors().find(|p| {
-    // Find the closest volume root (e.g., C:\)
-    if let Some(root) = p.components().next() {
-      // Check if this is a root directory (like "C:")
-      if let std::path::Component::Prefix(prefix) = root {
-        // For Windows, check if this is a disk prefix (like "C:")
-        if let std::path::Prefix::Disk(_) = prefix.kind() {
-          return true;
+  println!("Checking if path is NTFS: {:?}", path);
+  
+  // Get the drive letter from the path, handling both verbatim and regular paths
+  let drive_letter = if let Some(root_path) = path.components().find(|comp| {
+    match comp {
+      std::path::Component::Prefix(prefix) => {
+        match prefix.kind() {
+          std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_) => true,
+          _ => false
         }
-      }
+      },
+      _ => false
     }
-    false
   }) {
-    // Convert to string representation for the volume
-    if let Some(root_str) = root_path.to_str() {
-      // Try to open as NTFS volume, e.g., "C:\"
-      let volume_path = format!("{}\\", root_str);
-      match ntfs_reader::volume::Volume::new(&volume_path) {
-        Ok(_) => true,
-        Err(_) => false,
-      }
-    } else {
-      false
+    match root_path {
+      std::path::Component::Prefix(prefix) => {
+        match prefix.kind() {
+          std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+            println!("Found disk prefix with letter: {}", letter as char);
+            Some(letter as char)
+          },
+          _ => None
+        }
+      },
+      _ => None
     }
   } else {
+    None
+  };
+  
+  let is_ntfs = if let Some(letter) = drive_letter {
+    // Construct a device path for the volume like "\\.\C:"
+    let volume_path = format!("\\\\.\\{}:", letter);
+    println!("Attempting to open NTFS volume: {}", volume_path);
+    
+    match ntfs_reader::volume::Volume::new(&volume_path) {
+      Ok(_) => {
+        println!("Successfully opened NTFS volume");
+        true
+      },
+      Err(e) => {
+        println!("Failed to open NTFS volume: {:?}", e);
+        false
+      },
+    }
+  } else {
+    println!("No drive letter found in path");
     false
   };
 
@@ -127,7 +147,13 @@ fn calculate_size_sync(
   if is_ntfs {
     // Store the current state of processed_paths for this path
     match calculate_size_ntfs(path, analytics_map.clone(), target_dir_path, visited_inodes.clone(), processed_paths.clone()) {
-      Ok(()) => return Ok(()),
+      Ok(()) => {
+        // for loop print key and value of analytics_map
+        // for ref_multi in analytics_map.iter() {
+          // println!("key: {:?}, value: {:?}", ref_multi.key(), ref_multi.value());
+        //}
+        return Ok(());
+      },
       Err(e) => {
         eprintln!("NTFS reading failed, falling back to traditional method: {}", e);
       }
@@ -148,31 +174,42 @@ fn calculate_size_ntfs(
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
   println!("windows calculate_size_ntfs: {:?}", path);
-  // Get the volume root from the path
-  let volume_root = path.ancestors()
-    .find(|p| {
-      if let Some(root) = p.components().next() {
-        if let std::path::Component::Prefix(prefix) = root {
-          if let std::path::Prefix::Disk(_) = prefix.kind() {
-            return true;
-          }
-        }
-      }
-      false
-    })
-    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Unable to determine volume root"))?;
   
-  // Convert to string representation for the volume
-  let volume_path = format!("{}\\", volume_root.to_str().ok_or_else(|| {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, "Unable to convert volume path to string")
-  })?);
-
-  println!("volume_path: {}", volume_path);
+  // Get the drive letter from the path, handling both verbatim and regular paths
+  let drive_letter = if let Some(root_path) = path.components().find(|comp| {
+    matches!(comp, std::path::Component::Prefix(prefix) if 
+      matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+  }) {
+    match root_path {
+      std::path::Component::Prefix(prefix) => {
+        match prefix.kind() {
+          std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+            Some(letter as char)
+          },
+          _ => None
+        }
+      },
+      _ => None
+    }
+  } else {
+    None
+  };
+  
+  // Construct the Windows device path format for NTFS volumes: \\.\C:
+  // This format is needed to access volumes directly
+  let volume_path = if let Some(letter) = drive_letter {
+    format!("\\\\.\\{}:", letter)
+  } else {
+    return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Unable to determine volume root"));
+  };
+  
+  println!("Using device path for NTFS volume: {}", volume_path);
   
   // Open the NTFS volume
   let volume = match ntfs_reader::volume::Volume::new(&volume_path) {
     Ok(vol) => vol,
     Err(e) => {
+      println!("Failed to open NTFS volume: {:?}", e);
       return Err(std::io::Error::new(
         std::io::ErrorKind::Other, 
         format!("Failed to open NTFS volume: {:?}", e)
@@ -190,264 +227,450 @@ fn calculate_size_ntfs(
       ));
     }
   };
-  
-  // Process the root path first
-  let relative_to_root = if path == volume_root {
-    PathBuf::new()
-  } else {
-    path.strip_prefix(volume_root)
-      .map(|p| p.to_path_buf())
-      .unwrap_or_else(|_| {
-        // If strip_prefix fails, try to get a relative path representation another way
-        if let (Some(path_str), Some(volume_str)) = (path.to_str(), volume_root.to_str()) {
-          if path_str.starts_with(volume_str) {
-            let relative = &path_str[volume_str.len()..];
-            let relative = relative.trim_start_matches(['/', '\\']);
-            return PathBuf::from(relative);
-          }
-        }
-        PathBuf::new()
-      })
-  };
 
-  // Tree nodes containing file/directory information
-  struct TreeNode {
-    record_number: u64,
-    parent_record_number: Option<u64>,
-    path: PathBuf,
-    name: String,
-    is_directory: bool,
-    size_bytes: u64,
-    size_allocated_bytes: u64,
-    entry_count: u64,
-    file_count: u64,
-    directory_count: u64,
-    last_modified_time: u64,
-    owner_name: Option<String>,
-    children: Vec<u64>, // Record numbers of children
-  }
+  // Find the path components we need to find in the filesystem
+  let mut target_path_components = Vec::new();
   
-  // Store tree nodes
-  let nodes: Arc<DashMap<u64, TreeNode>> = Arc::new(DashMap::new());
-  
-  // Create a cache for path computations
-  let mut path_cache = ntfs_reader::file_info::HashMapCache::default();
-  
-  // First pass: Create nodes and establish parent-child relationships
-  mft.iterate_files(|file| {
-    let record_number = file.number();
-    let is_directory = file.is_directory();
-    let file_info = ntfs_reader::file_info::FileInfo::with_cache(&mft, file, &mut path_cache);
-    
-    // Skip files not relevant to our target path
-    let is_relevant = if relative_to_root.as_os_str().is_empty() {
-      // If we're scanning the root, all files are relevant
-      true
-    } else {
-      // Otherwise, check if the file is within our target directory
-      file_info.path.starts_with(path)
-    };
-    
-    if !is_relevant {
-      return;
-    }
-    
-    // Get parent record number from file name
-    let parent_record_number = file.get_best_file_name(&mft).map(|name| name.parent());
-    
-    // Get file size
-    let size_bytes = file_info.size;
-    let size_allocated_bytes = (size_bytes + 4095) & !4095;
-    
-    // Create the tree node
-    let node = TreeNode {
-      record_number,
-      parent_record_number,
-      path: file_info.path.clone(),
-      name: file_info.name,
-      is_directory,
-      size_bytes,
-      size_allocated_bytes,
-      entry_count: 1,
-      file_count: if is_directory { 0 } else { 1 },
-      directory_count: if is_directory { 1 } else { 0 },
-      last_modified_time: file_info.modified.map(|t| t.unix_timestamp() as u64).unwrap_or(0),
-      owner_name: platform::get_path_owner(&file_info.path),
-      children: Vec::new(),
-    };
-    
-    // Add the node to our collection
-    nodes.insert(record_number, node);
-    
-    // Mark the path as processed
-    processed_paths.insert(file_info.path);
-  });
-  
-  // Second pass: Link children to parents
-  // Use a temporary structure to collect parent-child relationships
-  let parent_child_pairs = Arc::new(DashMap::new());
-  
-  // First collect all parent-child relationships
-  // DashMap doesn't directly support Rayon's parallel iteration, so use its own iter() method
-  let node_pairs: Vec<_> = nodes.iter().map(|entry| {
-    (
-      *entry.key(),
-      entry.value().parent_record_number
-    )
-  }).collect();
-  
-  // Now process these pairs in parallel using Rayon
-  node_pairs.par_iter().for_each(|(record_number, parent_record_opt)| {
-    if let Some(parent_record) = parent_record_opt {
-      parent_child_pairs.entry(*parent_record)
-        .or_insert_with(Vec::new)
-        .push(*record_number);
-    }
-  });
-  
-  // Then update parent nodes with their children
-  // Convert to Vec first to use Rayon's parallelism
-  let parent_records: Vec<_> = parent_child_pairs.iter()
-    .map(|entry| (*entry.key(), entry.value().clone()))
-    .collect();
-  
-  parent_records.par_iter().for_each(|(parent_record, children)| {
-    if let Some(mut parent_node) = nodes.get_mut(parent_record) {
-      parent_node.children.extend(children.iter());
-    }
-  });
-  
-  // Helper function to recursively compute sizes bottom-up
-  fn compute_sizes(
-    nodes: &DashMap<u64, TreeNode>,
-    record_number: u64,
-    analytics_map: &DashMap<PathBuf, Arc<AnalyticsInfo>>,
-    processed: &DashSet<u64>,
-  ) -> (u64, u64, u64, u64, u64) {
-    // Skip if already processed
-    if !processed.insert(record_number) {
-      return (0, 0, 0, 0, 0);
-    }
-    
-    // Get the node
-    if let Some(node) = nodes.get(&record_number) {
-      let base_size = node.size_bytes;
-      let base_allocated = node.size_allocated_bytes;
-      let base_entries = node.entry_count;
-      let base_files = node.file_count;
-      let base_dirs = node.directory_count;
+  // Extract the path components after the drive letter
+  if let Some(letter) = drive_letter {
+    // Convert to a clean string representation of the path
+    if let Some(path_str) = path.to_str() {
+      // Find where the path starts after the drive letter
+      let drive_prefix = format!("{}:\\", letter);
+      let verbatim_drive_prefix = format!("\\\\?\\{}:\\", letter);
       
-      // Process all children
-      let children = node.children.clone();
-      drop(node); // Release the reference before recursive calls
-      
-      // Use parallel processing for directories with many children
-      let (total_size, total_allocated, total_entries, total_files, total_dirs) = if children.is_empty() {
-        // No children, return zeros
-        (0, 0, 0, 0, 0)
-      } else if children.len() > 10 {
-        // Parallel processing with Rayon
-        children.par_iter()
-          .map(|&child_record| compute_sizes(nodes, child_record, analytics_map, processed))
-          .reduce(
-            || (0, 0, 0, 0, 0),
-            |(s1, a1, e1, f1, d1), (s2, a2, e2, f2, d2)| (
-              s1 + s2,
-              a1 + a2,
-              e1 + e2,
-              f1 + f2,
-              d1 + d2,
-            )
-          )
+      let path_without_drive = if path_str.starts_with(&verbatim_drive_prefix) {
+        &path_str[verbatim_drive_prefix.len()..]
+      } else if path_str.starts_with(&drive_prefix) {
+        &path_str[drive_prefix.len()..]
       } else {
-        // Sequential processing for small directories
-        let mut size = 0;
-        let mut allocated = 0;
-        let mut entries = 0;
-        let mut files = 0;
-        let mut dirs = 0;
-        
-        for &child_record in &children {
-          let (s, a, e, f, d) = compute_sizes(nodes, child_record, analytics_map, processed);
-          size += s;
-          allocated += a;
-          entries += e;
-          files += f;
-          dirs += d;
-        }
-        
-        (size, allocated, entries, files, dirs)
+        path_str // Just use the whole path as a fallback
       };
       
-      let total_size = base_size + total_size;
-      let total_allocated = base_allocated + total_allocated;
-      let total_entries = base_entries + total_entries;
-      let total_files = base_files + total_files;
-      let total_dirs = base_dirs + total_dirs;
+      // Split the path into components, filtering out empty segments
+      target_path_components = path_without_drive
+        .split(|c| c == '/' || c == '\\')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    }
+  }
+  
+  println!("Searching for path components: {:?}", target_path_components);
+  
+  // We'll start our search from the root directory (ROOT_RECORD = 5)
+  let root_record_num = ntfs_reader::api::ROOT_RECORD;
+  
+  // Find the target directory in the NTFS filesystem
+  let target_record = find_path_in_mft(&mft, root_record_num, &target_path_components)?;
+  
+  if let Some(record_num) = target_record {
+    println!("Found target directory at record {}", record_num);
+    
+    // Initialize a new collection for tracking processed records
+    let processed_records = Arc::new(DashSet::new());
+    
+    // Create a standardized version of the path for consistent comparisons
+    let normalized_path = normalize_windows_path(path);
+    
+    // Recursively calculate the size of the target directory
+    // The calculate_directory_sizes function will add entries to analytics_map
+    // for all subdirectories and files, using proper paths
+    let (size, allocated_size, entries, files, dirs) = 
+      calculate_directory_sizes(&mft, record_num, &processed_records, analytics_map.clone())?;
+    
+    println!("Directory statistics: size={}, allocated={}, entries={}, files={}, dirs={}",
+      size, allocated_size, entries, files, dirs);
+    
+    // Print a sample of the analytics map for debugging
+    println!("Analytics map after NTFS scanning (sample of up to 5 entries):");
+    let mut counter = 0;
+    for entry in analytics_map.iter() {
+      println!("  Path: {:?}, Size: {}, Files: {}, Dirs: {}", 
+        entry.key(), entry.size_bytes, entry.file_count, entry.directory_count);
+      counter += 1;
+      if counter >= 5 {
+        break;
+      }
+    }
+    
+    // Check if the exact normalized target path is in the analytics map after traversal
+    if !analytics_map.contains_key(&normalized_path) {
+      println!("Target path not found in analytics map: {:?}", normalized_path);
+      println!("Will attempt to recover entry by record number");
       
-      // Update the node with aggregated values
-      if let Some(mut node) = nodes.get_mut(&record_number) {
-        node.size_bytes = total_size;
-        node.size_allocated_bytes = total_allocated;
-        node.entry_count = total_entries;
-        node.file_count = total_files;
-        node.directory_count = total_dirs;
+      // Get the entry by record number using the existing MFT path that was created
+      let mut record_path_found = false;
+      for entry in analytics_map.iter() {
+        if let Some(path_info) = &entry.path_info {
+          if let Some((_, record)) = path_info.inode_device {
+            if record == record_num {
+              // Create a new entry with our exact path
+              analytics_map.insert(normalized_path.clone(), Arc::new(AnalyticsInfo {
+                path: normalized_path.clone(),
+                size_bytes: entry.size_bytes,
+                size_allocated_bytes: entry.size_allocated_bytes,
+                entry_count: entry.entry_count,
+                file_count: entry.file_count,
+                directory_count: entry.directory_count,
+                last_modified_time: entry.last_modified_time,
+                owner_name: entry.owner_name.clone(),
+                path_info: entry.path_info.clone(),
+              }));
+              record_path_found = true;
+              println!("Recovered entry by record number: {:?}", normalized_path);
+              break;
+            }
+          }
+        }
+      }
+      
+      // If we still didn't find a matching entry, create a new one with the target statistics
+      if !record_path_found {
+        println!("Creating new entry for target path: {:?}", normalized_path);
         
-        // Add to analytics map
+        // Get the record from MFT
+        let dir_record = mft.get_record(record_num)
+          .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Target record not found"))?;
+        
         let path_info = platform::PathInfo {
-          is_dir: node.is_directory,
-          is_file: !node.is_directory,
+          is_dir: true,
+          is_file: false,
           is_symlink: false,
-          size_bytes: total_size,
-          size_allocated_bytes: total_allocated,
-          inode_device: Some((0, record_number)), // Use record number as inode
-          times: (node.last_modified_time as i64, 0, 0),
-          owner_name: node.owner_name.clone(),
+          size_bytes: size,
+          size_allocated_bytes: allocated_size,
+          inode_device: Some((0, record_num)), // Use NTFS record number as inode
+          times: (
+            dir_record.get_modification_time().map(|t| t.unix_timestamp()).unwrap_or(0),
+            dir_record.get_access_time().map(|t| t.unix_timestamp()).unwrap_or(0),
+            dir_record.get_creation_time().map(|t| t.unix_timestamp()).unwrap_or(0)
+          ),
+          owner_name: platform::get_path_owner(&normalized_path),
         };
         
-        analytics_map.insert(node.path.clone(), Arc::new(AnalyticsInfo {
-          path: node.path.clone(),
-          size_bytes: total_size,
-          size_allocated_bytes: total_allocated,
-          entry_count: total_entries,
-          file_count: total_files,
-          directory_count: total_dirs,
-          last_modified_time: node.last_modified_time,
-          owner_name: node.owner_name.clone(),
+        analytics_map.insert(normalized_path.clone(), Arc::new(AnalyticsInfo {
+          path: normalized_path,
+          size_bytes: size,
+          size_allocated_bytes: allocated_size,
+          entry_count: entries,
+          file_count: files,
+          directory_count: dirs,
+          last_modified_time: path_info.times.0 as u64,
+          owner_name: path_info.owner_name.clone(),
           path_info: Some(path_info),
         }));
       }
-      
-      return (total_size, total_allocated, total_entries, total_files, total_dirs);
     }
     
-    (0, 0, 0, 0, 0)
+    // Mark this path as processed
+    processed_paths.insert(path.to_path_buf());
+    
+    return Ok(());
+  } else {
+    println!("Target directory not found in MFT, falling back to traditional method");
+    processed_paths.remove(path);
+    return calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths);
   }
-  
-  // Find our target node's record number
-  let mut target_record = None;
-  for node_entry in nodes.iter() {
-    if node_entry.value().path == path {
-      target_record = Some(*node_entry.key());
-      break;
+}
+
+// Helper function to normalize Windows paths (remove verbatim prefixes, etc.)
+#[cfg(target_os = "windows")]
+fn normalize_windows_path(path: &Path) -> PathBuf {
+  if let Some(path_str) = path.to_str() {
+    // Handle verbatim paths (\\?\)
+    if path_str.starts_with("\\\\?\\") {
+      if path_str.len() > 4 {
+        return PathBuf::from(&path_str[4..]);
+      }
+    }
+    
+    // Handle UNC paths
+    if path_str.starts_with("\\\\") && !path_str.starts_with("\\\\.\\") {
+      // UNC paths are already in a standard format
+      return path.to_path_buf();
+    }
+    
+    // Handle device paths as in normalize_ntfs_path
+    if path_str.starts_with("\\\\.\\") {
+      return normalize_ntfs_path(path);
     }
   }
   
-  // If the target path was found in the MFT, compute sizes starting from there
-  if let Some(record) = target_record {
-    let processed = DashSet::new();
-    compute_sizes(&nodes, record, &analytics_map, &processed);
-    return Ok(());
+  // If no special handling needed, return the original path
+  path.to_path_buf()
+}
+
+// Add these helper methods to NtfsFile for accessing time attributes
+#[cfg(target_os = "windows")]
+trait NtfsFileExt {
+  fn get_creation_time(&self) -> Option<time::OffsetDateTime>;
+  fn get_modification_time(&self) -> Option<time::OffsetDateTime>;
+  fn get_access_time(&self) -> Option<time::OffsetDateTime>;
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> NtfsFileExt for ntfs_reader::file::NtfsFile<'a> {
+  fn get_creation_time(&self) -> Option<time::OffsetDateTime> {
+    let mut time = None;
+    self.attributes(|attr| {
+      if attr.header.type_id == ntfs_reader::api::NtfsAttributeType::StandardInformation as u32 {
+        let stdinfo = attr.as_standard_info();
+        time = Some(ntfs_reader::api::ntfs_to_unix_time(stdinfo.creation_time));
+      }
+    });
+    time
   }
   
-  // If we didn't find the target path in MFT, fall back to traditional method
-  eprintln!("Path {:?} not found in MFT, falling back to traditional method", path);
+  fn get_modification_time(&self) -> Option<time::OffsetDateTime> {
+    let mut time = None;
+    self.attributes(|attr| {
+      if attr.header.type_id == ntfs_reader::api::NtfsAttributeType::StandardInformation as u32 {
+        let stdinfo = attr.as_standard_info();
+        time = Some(ntfs_reader::api::ntfs_to_unix_time(stdinfo.modification_time));
+      }
+    });
+    time
+  }
   
-  // We need to remove this path from processed_paths to ensure the traditional method processes it
-  processed_paths.remove(path);
+  fn get_access_time(&self) -> Option<time::OffsetDateTime> {
+    let mut time = None;
+    self.attributes(|attr| {
+      if attr.header.type_id == ntfs_reader::api::NtfsAttributeType::StandardInformation as u32 {
+        let stdinfo = attr.as_standard_info();
+        time = Some(ntfs_reader::api::ntfs_to_unix_time(stdinfo.access_time));
+      }
+    });
+    time
+  }
+}
+
+// Helper function to find a path in the MFT
+#[cfg(target_os = "windows")]
+fn find_path_in_mft(
+  mft: &ntfs_reader::mft::Mft,
+  start_record: u64,
+  path_components: &[String]
+) -> std::io::Result<Option<u64>> {
+  // If we've reached the end of the path components, we've found our target
+  if path_components.is_empty() {
+    return Ok(Some(start_record));
+  }
   
-  // Use the traditional calculation method for this path
-  calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
+  // Get the starting directory record
+  let dir_record = match mft.get_record(start_record) {
+    Some(record) => record,
+    None => return Ok(None),
+  };
+  
+  // Ensure it's a directory
+  if !dir_record.is_directory() {
+    return Ok(None);
+  }
+  
+  // Current component we're looking for
+  let current_component = &path_components[0];
+  let remaining_components = &path_components[1..];
+  
+  // Case-insensitive comparison for Windows
+  let current_component_lower = current_component.to_lowercase();
+  
+  // Find child entries in the directory
+  let mut children = Vec::new();
+  
+  // Use file_index attribute or iterate the entire MFT
+  // For simplicity, we'll iterate all files in the MFT and filter those with this parent
+  mft.iterate_files(|file| {
+    if let Some(filename) = file.get_best_file_name(mft) {
+      // Check if this file's parent is our current directory
+      if filename.parent() == start_record {
+        // Compare with our target component
+        let name = filename.to_string();
+        if name.to_lowercase() == current_component_lower {
+          children.push((file.number(), name));
+        }
+      }
+    }
+  });
+  
+  // If we found matching children, recursively search in the first one
+  if !children.is_empty() {
+    // Sort by name to ensure deterministic behavior
+    children.sort_by(|a, b| a.1.cmp(&b.1));
+    
+    // Use the record number of the first matching child
+    let (child_record, _) = &children[0];
+    
+    // Recursively find the next component
+    return find_path_in_mft(mft, *child_record, remaining_components);
+  }
+  
+  // If we can't find a matching child, return None
+  Ok(None)
+}
+
+// Helper function to calculate directory sizes recursively
+#[cfg(target_os = "windows")]
+fn calculate_directory_sizes(
+  mft: &ntfs_reader::mft::Mft,
+  record_num: u64,
+  processed_records: &Arc<DashSet<u64>>,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>
+) -> std::io::Result<(u64, u64, u64, u64, u64)> {
+  // Skip if we've already processed this record
+  if !processed_records.insert(record_num) {
+    return Ok((0, 0, 0, 0, 0));
+  }
+  
+  // Get the record
+  let record = match mft.get_record(record_num) {
+    Some(r) => r,
+    None => return Ok((0, 0, 0, 0, 0)),
+  };
+  
+  // Check if it's a directory
+  let is_directory = record.is_directory();
+  
+  // Get the file/directory size
+  let base_size = if is_directory {
+    // Directories usually have a size 0, but we'll count their own disk allocation
+    // Default cluster size for NTFS is 4KB
+    4096
+  } else {
+    // For files, use the data attribute size
+    let mut size = 0;
+    record.attributes(|attr| {
+      if attr.header.type_id == ntfs_reader::api::NtfsAttributeType::Data as u32 {
+        // Use the appropriate size based on resident/non-resident
+        if attr.header.is_non_resident == 0 {
+          size = attr.header_res.value_length as u64;
+        } else {
+          size = attr.header_nonres.data_size;
+        }
+      }
+    });
+    size
+  };
+  
+  // Calculate allocated size (round up to nearest 4KB)
+  let base_allocated_size = (base_size + 4095) & !4095;
+  
+  // Count this as one entry
+  let base_entries = 1;
+  
+  // Count as file or directory
+  let base_files = if is_directory { 0 } else { 1 };
+  let base_dirs = if is_directory { 1 } else { 0 };
+  
+  // Get path of this record for analytics map
+  // Create a new HashMapCache for each call to avoid path conflicts between different branches
+  let mut path_cache = ntfs_reader::file_info::HashMapCache::default();
+  
+  // Get the full path for this record
+  let file_info = ntfs_reader::file_info::FileInfo::with_cache(mft, &record, &mut path_cache);
+  let raw_record_path = file_info.path.clone();
+  
+  // Normalize the path - convert from device path format (\\.\C:) to standard Windows path (C:)
+  let record_path = normalize_ntfs_path(&raw_record_path);
+  
+  // If this is a directory, process all children
+  let mut total_size = base_size;
+  let mut total_allocated_size = base_allocated_size;
+  let mut total_entries = base_entries;
+  let mut total_files = base_files;
+  let mut total_dirs = base_dirs;
+  
+  // Create a map to collect all immediate children of this directory
+  let mut children = Vec::new();
+  
+  if is_directory {
+    // Iterate through all files in the MFT, finding those with this directory as parent
+    mft.iterate_files(|file| {
+      if let Some(filename) = file.get_best_file_name(mft) {
+        // Check if this file's parent is our current directory
+        if filename.parent() == record_num {
+          children.push(file.number());
+        }
+      }
+    });
+    
+    // Process all children in parallel using Rayon
+    let children_results: Vec<(u64, u64, u64, u64, u64)> = children.par_iter()
+      .map(|&child_record| {
+        // Calculate sizes for this child
+        calculate_directory_sizes(mft, child_record, processed_records, analytics_map.clone())
+          .unwrap_or((0, 0, 0, 0, 0))
+      })
+      .collect();
+    
+    // Sum up all children's contributions
+    for (size, allocated, entries, files, dirs) in children_results {
+      total_size += size;
+      total_allocated_size += allocated;
+      total_entries += entries;
+      total_files += files;
+      total_dirs += dirs;
+    }
+  }
+  
+  // Create path info for this record
+  let path_info = platform::PathInfo {
+    is_dir: is_directory,
+    is_file: !is_directory,
+    is_symlink: false,
+    size_bytes: total_size,
+    size_allocated_bytes: total_allocated_size,
+    inode_device: Some((0, record_num)), // Use NTFS record number as inode
+    times: (
+      record.get_modification_time().map(|t| t.unix_timestamp()).unwrap_or(0),
+      record.get_access_time().map(|t| t.unix_timestamp()).unwrap_or(0),
+      record.get_creation_time().map(|t| t.unix_timestamp()).unwrap_or(0)
+    ),
+    owner_name: platform::get_path_owner(&record_path),
+  };
+  
+  // Add to analytics map with normalized path
+  analytics_map.insert(record_path.clone(), Arc::new(AnalyticsInfo {
+    path: record_path,
+    size_bytes: total_size,
+    size_allocated_bytes: total_allocated_size,
+    entry_count: total_entries,
+    file_count: total_files,
+    directory_count: total_dirs,
+    last_modified_time: path_info.times.0 as u64,
+    owner_name: path_info.owner_name.clone(),
+    path_info: Some(path_info),
+  }));
+  
+  Ok((total_size, total_allocated_size, total_entries, total_files, total_dirs))
+}
+
+// Helper function to normalize NTFS paths
+#[cfg(target_os = "windows")]
+fn normalize_ntfs_path(path: &Path) -> PathBuf {
+  if let Some(path_str) = path.to_str() {
+    // Look for device path format like \\.\C:... or any other format with \\.\
+    if path_str.starts_with("\\\\.\\") {
+      // First, try to extract drive letter if it's a drive path
+      if let Some(pos) = path_str.find(":\\") {
+        if pos > 0 {
+          // Get the drive letter and everything after it
+          let drive_letter = path_str.chars().nth(pos-1).unwrap();
+          let rest_of_path = &path_str[pos..];
+          
+          // Construct standard Windows path
+          return PathBuf::from(format!("{}{}", drive_letter, rest_of_path));
+        }
+      }
+      
+      // If we couldn't find a drive letter, just remove the \\.\
+      if path_str.len() > 4 {
+        return PathBuf::from(&path_str[4..]);
+      }
+    }
+  }
+  
+  // If we couldn't normalize, just return the original path
+  path.to_path_buf()
 }
 
 fn calculate_size_traditional(
@@ -457,7 +680,7 @@ fn calculate_size_traditional(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
-  println!("calculate_size_traditional: {:?}", path);
+  // println!("calculate_size_traditional: {:?}", path);
   // If we've already processed this path, skip it
   if !processed_paths.insert(path.to_path_buf()) {
     return Ok(());
@@ -630,11 +853,27 @@ fn build_tree_from_entries_with_depth(
   // should total size of the virtual directory node is the sum of the size of file1, file2, file3
   build_virtual_directory_node: bool,
 ) -> FileSystemTreeNode {
+  // Normalize the root path to ensure consistent path comparisons
+  #[cfg(target_os = "windows")]
+  let normalized_root_path = normalize_windows_path(root_path);
+  #[cfg(not(target_os = "windows"))]
+  let normalized_root_path = root_path.to_path_buf();
+  
   // Create a map of path -> entry for quick lookups
   let path_map: HashMap<PathBuf, &AnalyticsInfo> = entries
     .iter()
-    .map(|entry| (entry.path.clone(), entry))
+    .map(|entry| {
+      // Normalize each path when building the map
+      #[cfg(target_os = "windows")]
+      let path = normalize_windows_path(&entry.path);
+      #[cfg(not(target_os = "windows"))]
+      let path = entry.path.clone();
+      
+      (path, entry)
+    })
     .collect();
+    
+  println!("Built path map with {} entries", path_map.len());
 
   // Create a map of parent path -> child paths
   let mut children_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -643,21 +882,45 @@ fn build_tree_from_entries_with_depth(
   let mut root_entry = None;
 
   for entry in entries {
-    if entry.path == root_path {
+    // Normalize the entry path for Windows
+    #[cfg(target_os = "windows")]
+    let entry_path = normalize_windows_path(&entry.path);
+    #[cfg(not(target_os = "windows"))]
+    let entry_path = entry.path.clone();
+
+    if entry_path == normalized_root_path {
       root_entry = Some(entry);
       continue;
     }
 
-    if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+    if let Some(parent_path_buf) = entry.path.parent().map(|p| p.to_path_buf()) {
+      // Normalize the parent path for Windows
+      #[cfg(target_os = "windows")]
+      let parent_path = normalize_windows_path(&parent_path_buf);
+      #[cfg(not(target_os = "windows"))]
+      let parent_path = parent_path_buf;
+      
       children_map
         .entry(parent_path)
         .or_default()
-        .push(entry.path.clone());
+        .push(entry_path);
     }
   }
 
   // Use the first entry if root not found
   let root_entry = root_entry.unwrap_or_else(|| {
+    println!("Root entry not found for path: {:?}, normalized: {:?}", 
+             root_path, normalized_root_path);
+    println!("Available paths (up to 10):");
+    for (i, entry) in entries.iter().take(10).enumerate() {
+      #[cfg(target_os = "windows")]
+      let normalized = normalize_windows_path(&entry.path);
+      #[cfg(not(target_os = "windows"))]
+      let normalized = entry.path.clone();
+      
+      println!("  {}: {:?} -> normalized: {:?}", i, entry.path, normalized);
+    }
+    
     entries.first().unwrap_or_else(|| {
       panic!("No entries found to build tree");
     })
@@ -672,6 +935,12 @@ fn build_tree_from_entries_with_depth(
     current_depth: usize,
     max_depth: usize,
   ) -> FileSystemTreeNode {
+    // Normalize the path for consistent comparison
+    #[cfg(target_os = "windows")]
+    let normalized_path = normalize_windows_path(path);
+    #[cfg(not(target_os = "windows"))]
+    let normalized_path = path.to_path_buf();
+    
     // Extract name from path
     let name = path
       .file_name()
@@ -682,7 +951,7 @@ fn build_tree_from_entries_with_depth(
     // Get children for this path if we haven't reached max depth
     let mut children = Vec::new();
     if current_depth < max_depth {
-      if let Some(child_paths) = children_map.get(path) {
+      if let Some(child_paths) = children_map.get(&normalized_path) {
         for child_path in child_paths {
           if let Some(child_entry) = path_map.get(child_path) {
             let child_node = build_node(
@@ -733,7 +1002,7 @@ fn build_tree_from_entries_with_depth(
   if !build_virtual_directory_node || (build_virtual_directory_node && root_entry.file_count == 0) {
     // Build the tree starting from the root with depth limit
     return build_node(
-      &root_entry.path,
+      &normalized_root_path,
       root_entry,
       &children_map,
       &path_map,
@@ -750,7 +1019,7 @@ fn build_tree_from_entries_with_depth(
   let mut virtual_dir_entry_count = 0;
   let mut virtual_dir_file_count = 0;
 
-  if let Some(child_paths) = children_map.get(&root_entry.path) {
+  if let Some(child_paths) = children_map.get(&normalized_root_path) {
     for child_path in child_paths {
       if let Some(child_entry) = path_map.get(child_path) {
         // Only include files (not directories) in the virtual directory
@@ -791,15 +1060,14 @@ fn build_tree_from_entries_with_depth(
 
   // Create the virtual directory node
   // Extract the root directory name and append "Files" to it
-  let root_name = root_entry
-    .path
+  let root_name = normalized_root_path
     .file_name()
     .and_then(|n| n.to_str())
     .unwrap_or("unknown");
   let virtual_dir_name = format!("{} Files", root_name);
 
   // Create a path for the virtual directory by appending the virtual directory name to parent path
-  let virtual_dir_path = if let Some(parent) = root_entry.path.parent() {
+  let virtual_dir_path = if let Some(parent) = normalized_root_path.parent() {
     parent.join(&virtual_dir_name)
   } else {
     PathBuf::from(&virtual_dir_name)
@@ -828,7 +1096,7 @@ fn build_tree_from_entries_with_depth(
 
   // Now build the main tree but exclude the files that are in the virtual directory
   let mut main_tree = build_node(
-    &root_entry.path,
+    &normalized_root_path,
     root_entry,
     &children_map,
     &path_map,
@@ -868,10 +1136,24 @@ fn build_tree_from_indices(
   max_depth: usize,
   build_virtual_directory_node: bool,
 ) -> Option<FileSystemTreeNode> {
-  // Find the index of the target path
-  let target_index = match path_map.get(target_path) {
+  // Normalize the target path for consistent path matching
+  #[cfg(target_os = "windows")]
+  let normalized_target_path = normalize_windows_path(target_path);
+  #[cfg(not(target_os = "windows"))]
+  let normalized_target_path = target_path.to_path_buf();
+  
+  // Find the index of the target path - need to check normalized paths
+  let target_index = match path_map.get(&normalized_target_path) {
     Some(&idx) => idx,
-    None => return None,
+    None => {
+      println!("Path not found in path_map: {:?} (normalized: {:?})", 
+               target_path, normalized_target_path);
+      println!("Available paths in map (up to 10):");
+      for (i, (path, _)) in path_map.iter().take(10).enumerate() {
+        println!("  {}: {:?}", i, path);
+      }
+      return None;
+    },
   };
 
   // Get the entry for the target path
@@ -952,7 +1234,7 @@ fn build_tree_from_indices(
   if !build_virtual_directory_node || (build_virtual_directory_node && target_entry.file_count == 0)
   {
     // Build the tree node
-    let children_indices = children_map.get(target_path);
+    let children_indices = children_map.get(&normalized_target_path);
     let node = build_node(
       target_path,
       target_entry,
@@ -967,7 +1249,7 @@ fn build_tree_from_indices(
 
   // We're building a virtual directory node
   // Get children indices for the target path
-  let children_indices = match children_map.get(target_path) {
+  let children_indices = match children_map.get(&normalized_target_path) {
     Some(indices) => indices,
     None => return None,
   };
@@ -1245,11 +1527,27 @@ fn build_indices(
   entries: &[AnalyticsInfo],
   target_dir: &Path,
 ) -> (HashMap<PathBuf, usize>, HashMap<PathBuf, Vec<usize>>) {
+  // Normalize the target directory for consistent path matching
+  #[cfg(target_os = "windows")]
+  let normalized_target_dir = normalize_windows_path(target_dir);
+  #[cfg(not(target_os = "windows"))]
+  let normalized_target_dir = target_dir.to_path_buf();
+  
+  println!("Building indices for target dir: {:?}", normalized_target_dir);
+
   // First pass: build path_map (map from path to index in entries) - parallelize this
   let path_map = entries
     .par_iter()
     .enumerate()
-    .map(|(i, entry)| (entry.path.clone(), i))
+    .map(|(i, entry)| {
+      // Normalize each path when building the map
+      #[cfg(target_os = "windows")]
+      let path = normalize_windows_path(&entry.path);
+      #[cfg(not(target_os = "windows"))]
+      let path = entry.path.clone();
+      
+      (path, i)
+    })
     .collect::<HashMap<_, _>>();
 
   // Second pass: build children_map
@@ -1258,9 +1556,15 @@ fn build_indices(
 
   // Populate the children map in parallel
   entries.par_iter().enumerate().for_each(|(i, entry)| {
-    if let Some(parent_path) = entry.path.parent().map(|p| p.to_path_buf()) {
+    if let Some(parent_path_buf) = entry.path.parent().map(|p| p.to_path_buf()) {
+      // Normalize the parent path for consistent matching
+      #[cfg(target_os = "windows")]
+      let parent_path = normalize_windows_path(&parent_path_buf);
+      #[cfg(not(target_os = "windows"))]
+      let parent_path = parent_path_buf;
+      
       // Skip entries that are outside our target directory
-      if !parent_path.starts_with(target_dir) && parent_path != *target_dir {
+      if !parent_path.starts_with(&normalized_target_dir) && parent_path != normalized_target_dir {
         return;
       }
 
@@ -1308,9 +1612,20 @@ async fn get_directory_children(path: String) -> Result<FileSystemTreeNode, Stri
       Ok(p) => p,
       Err(e) => return Err(format!("Failed to canonicalize path: {}", e)),
     };
+    
+    // Normalize the paths for consistent comparison
+    #[cfg(target_os = "windows")]
+    let normalized_target_dir = normalize_windows_path(&target_dir);
+    #[cfg(not(target_os = "windows"))]
+    let normalized_target_dir = target_dir.clone();
+    
+    #[cfg(target_os = "windows")]
+    let normalized_root_path = normalize_windows_path(&cache.root_path);
+    #[cfg(not(target_os = "windows"))]
+    let normalized_root_path = cache.root_path.clone();
 
     // Check if the requested path is within our cached data (it should be a subpath of the root)
-    if !target_dir.starts_with(&cache.root_path) && target_dir != cache.root_path {
+    if !normalized_target_dir.starts_with(&normalized_root_path) && normalized_target_dir != normalized_root_path {
       return Err(format!(
         "Path {} is not within the scanned directory {}",
         target_dir.display(),
@@ -1331,13 +1646,34 @@ async fn get_directory_children(path: String) -> Result<FileSystemTreeNode, Stri
     }
 
     // If the optimized method failed (unlikely), fall back to the original method
-    let entry = cache.entries.iter().find(|e| e.path == target_dir);
+    let entry = cache.entries.iter().find(|e| {
+      #[cfg(target_os = "windows")]
+      {
+        let normalized_entry_path = normalize_windows_path(&e.path);
+        normalized_entry_path == normalized_target_dir
+      }
+      #[cfg(not(target_os = "windows"))]
+      {
+        e.path == target_dir
+      }
+    });
 
     if let Some(_) = entry {
       // Build a tree using the original method
       let tree = build_tree_from_entries_with_depth(&cache.entries, &target_dir, 1, true);
       return Ok(tree);
     } else {
+      println!("Path not found in cache entries: {:?}", normalized_target_dir);
+      println!("Available paths in cache (up to 10):");
+      for (i, entry) in cache.entries.iter().take(10).enumerate() {
+        #[cfg(target_os = "windows")]
+        let normalized = normalize_windows_path(&entry.path);
+        #[cfg(not(target_os = "windows"))]
+        let normalized = entry.path.clone();
+        
+        println!("  {}: {:?} -> normalized: {:?}", i, entry.path, normalized);
+      }
+      
       return Err(format!(
         "Path {} not found in scan data",
         target_dir.display()
