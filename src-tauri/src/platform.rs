@@ -4,6 +4,19 @@ use std::fs;
 use std::path::Path;
 
 use serde::Serialize;
+use dashmap::DashMap;
+use lazy_static::lazy_static;
+
+// Owner cache to avoid redundant lookups
+#[cfg(target_family = "unix")]
+lazy_static! {
+    static ref OWNER_CACHE: DashMap<String, String> = DashMap::new();
+}
+
+#[cfg(target_os = "windows")]
+lazy_static! {
+    static ref OWNER_CACHE: DashMap<String, String> = DashMap::new();
+}
 
 #[cfg(target_family = "unix")]
 fn get_block_size() -> u64 {
@@ -57,7 +70,7 @@ pub fn get_path_info<P: AsRef<Path>>(path: P, follow_links: bool) -> Option<Path
   let is_symlink = metadata.file_type().is_symlink();
 
   // Get the owner name
-  let owner_name = get_owner_name(path_ref, &metadata);
+  let owner_name = get_owner_name(path, &metadata);
 
   Some(PathInfo {
     size_bytes,
@@ -325,15 +338,35 @@ pub fn get_space_info<P: AsRef<Path>>(path: P) -> Option<(u64, u64, u64)> {
 }
 
 #[cfg(target_family = "unix")]
-fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Option<String> {
+fn get_owner_name<P: AsRef<Path>>(path: P, metadata: &std::fs::Metadata) -> Option<String> {
   use std::os::unix::fs::MetadataExt;
   use users::get_user_by_uid;
 
-  let uid = metadata.uid();
-  match get_user_by_uid(uid) {
-    Some(user) => Some(user.name().to_string_lossy().into_owned()),
-    None => Some(format!("<deleted user {}>", uid)), // More explicit format for deleted users
+  let path_str = path.as_ref().to_string_lossy().into_owned();
+  
+  // Check if the path is already in the cache
+  if let Some(cached) = OWNER_CACHE.get(&path_str) {
+    return Some(cached.clone());
   }
+  
+  // If not in cache, perform the lookup
+  let uid = metadata.uid();
+  let name = match get_user_by_uid(uid) {
+    Some(user) => {
+      let name = user.name().to_string_lossy().into_owned();
+      // Add to cache
+      OWNER_CACHE.insert(path_str, name.clone());
+      Some(name)
+    },
+    None => {
+      let name = format!("<deleted user {}>", uid);
+      // Add to cache
+      OWNER_CACHE.insert(path_str, name.clone());
+      Some(name)
+    },
+  };
+  
+  name
 }
 
 #[cfg(target_os = "windows")]
@@ -342,6 +375,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
   use std::os::windows::ffi::{OsStrExt, OsStringExt};
   use winapi::ctypes::c_void;
   use winapi::shared::winerror::ERROR_SUCCESS;
+  use winapi::shared::sddl;
   use winapi::um::accctrl::SE_FILE_OBJECT;
   use winapi::um::aclapi::GetNamedSecurityInfoW;
   use winapi::um::securitybaseapi::GetSecurityDescriptorOwner;
@@ -351,8 +385,15 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     OWNER_SECURITY_INFORMATION, PSID,
   };
 
-  let path = path.as_ref();
-  let path_wide: Vec<u16> = path
+  let path_ref = path.as_ref();
+  let path_str = path_ref.to_string_lossy().into_owned();
+  
+  // Check if the path is already in the cache
+  if let Some(cached) = OWNER_CACHE.get(&path_str) {
+    return Some(cached.clone());
+  }
+  
+  let path_wide: Vec<u16> = path_ref
     .as_os_str()
     .encode_wide()
     .chain(std::iter::once(0))
@@ -400,7 +441,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       eprintln!("Owner SID is null");
       return None;
     }
-
+    
     // Convert SID to name
     let mut name_size = 0;
     let mut domain_size = 0;
@@ -442,28 +483,48 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     }
 
     // Accept more SID types - not just users but also groups and aliases
-    match sid_type {
+    let name = match sid_type {
       t if t == SidTypeUser || t == SidTypeWellKnownGroup || t == SidTypeAlias => {
         // These are all valid owner types
         let name = OsString::from_wide(&name_buf[0..(name_size - 1) as usize]);
         match name.into_string() {
-          Ok(name_str) => Some(name_str),
+          Ok(name_str) => {
+            // Add to cache
+            OWNER_CACHE.insert(path_str, name_str.clone());
+            Some(name_str)
+          },
           Err(_) => {
             eprintln!("Failed to convert name to string");
             None
           }
         }
-      }
-      t if t == SidTypeDeletedAccount => Some("<deleted account>".to_string()),
+      },
+      t if t == SidTypeDeletedAccount => {
+        let name = "<deleted account>".to_string();
+        // Add to cache
+        OWNER_CACHE.insert(path_str, name.clone());
+        Some(name)
+      },
       _ => {
         eprintln!("Unsupported SID type: {}", sid_type);
         None
       }
-    }
+    };
+    
+    name
   }
 }
 
 #[cfg(not(any(target_family = "unix", target_os = "windows")))]
 fn get_owner_name<P: AsRef<Path>>(_path: P, _metadata: &std::fs::Metadata) -> Option<String> {
   None
+}
+
+/// Get the owner name for a path (convenience wrapper around get_owner_name)
+pub fn get_path_owner<P: AsRef<Path>>(path: P) -> Option<String> {
+  if let Ok(metadata) = std::fs::metadata(path.as_ref()) {
+    get_owner_name(path, &metadata)
+  } else {
+    None
+  }
 }
