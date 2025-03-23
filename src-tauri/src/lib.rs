@@ -191,9 +191,6 @@ fn calculate_size_ntfs(
     }
   };
   
-  // Create a cache for paths
-  let mut cache = ntfs_reader::file_info::HashMapCache::default();
-  
   // Process the root path first
   let relative_to_root = if path == volume_root {
     PathBuf::new()
@@ -212,170 +209,239 @@ fn calculate_size_ntfs(
         PathBuf::new()
       })
   };
+
+  // Define data structures for building the tree
+
+  // Maps MFT record numbers to tree node indices
+  let id_to_index = DashMap::new();
   
-  // Gather all files recursively using MFT
-  let mut entries = Vec::new();
-  
-  // Iterate through all MFT records
-  mft.iterate_files(|file| {
-    // Get file info with path computation
-    let file_info = ntfs_reader::file_info::FileInfo::with_cache(&mft, file, &mut cache);
-    
-    // Check if this file is within our target directory
-    if file_info.path.starts_with(&relative_to_root) || file_info.path == relative_to_root {
-      // Reconstruct the full path
-      let full_path = if relative_to_root.as_os_str().is_empty() {
-        // If we're scanning the root, use volume_root + file path
-        volume_root.join(&file_info.path)
-      } else {
-        // Otherwise reconstruct from volume root + relative target path + relative file path
-        let file_rel_to_target = file_info.path.strip_prefix(&relative_to_root)
-          .map(|p| p.to_path_buf())
-          .unwrap_or_else(|_| file_info.path.clone());
-        path.join(file_rel_to_target)
-      };
-      
-      entries.push((full_path, file_info));
-    }
-  });
-  
-  // Check if the target path is in the MFT records
-  if !entries.iter().any(|(entry_path, _)| entry_path == path) {
-    // If we didn't find the target path in MFT, fall back to traditional method
-    eprintln!("Path {:?} not found in MFT, falling back to traditional method", path);
-    
-    // We need to remove this path from processed_paths to ensure the traditional method processes it
-    processed_paths.remove(path);
-    
-    // Use the traditional calculation method for this path
-    return calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths);
+  // Tree nodes containing file/directory information
+  struct TreeNode {
+    record_number: u64,
+    parent_record_number: Option<u64>,
+    path: PathBuf,
+    name: String,
+    is_directory: bool,
+    size_bytes: u64,
+    size_allocated_bytes: u64,
+    entry_count: u64,
+    file_count: u64,
+    directory_count: u64,
+    last_modified_time: u64,
+    owner_name: Option<String>,
+    children: Vec<u64>, // Record numbers of children
   }
-
-  // Group entries by parent path
-  let parent_to_children: DashMap<PathBuf, Vec<PathBuf>> = DashMap::new();
-  entries.par_iter().for_each(|(entry_path, _)| {
-    if let Some(parent) = entry_path.parent().map(|p| p.to_path_buf()) {
-      parent_to_children.entry(parent).or_insert_with(Vec::new).push(entry_path.clone());
-    }
-  });
-
-  // Sort entries by path depth, deepest first
-  let mut sorted_entries = entries.iter().collect::<Vec<_>>();
-  sorted_entries.sort_by_key(|(path, _)| {
-    std::cmp::Reverse(path.components().count())
-  });
-
-  // First, add all entries to the analytics map in parallel
-  entries.par_iter().for_each(|(entry_path, file_info)| {
-    let entry_count = 1;
-    let file_count = if file_info.is_directory { 0 } else { 1 };
-    let directory_count = if file_info.is_directory { 1 } else { 0 };
-    let last_modified_time = file_info.modified
-      .map(|t| t.unix_timestamp() as u64)
-      .unwrap_or(0);
+  
+  // Store tree nodes
+  let nodes = Arc::new(DashMap::new());
+  
+  // Create a cache for path computations
+  let mut path_cache = ntfs_reader::file_info::HashMapCache::default();
+  
+  // First pass: Create nodes and establish parent-child relationships
+  mft.iterate_files(|file| {
+    let record_number = file.number();
+    let is_directory = file.is_directory();
+    let file_info = ntfs_reader::file_info::FileInfo::with_cache(&mft, file, &mut path_cache);
     
+    // Skip files not relevant to our target path
+    let is_relevant = if relative_to_root.as_os_str().is_empty() {
+      // If we're scanning the root, all files are relevant
+      true
+    } else {
+      // Otherwise, check if the file is within our target directory
+      file_info.path.starts_with(path)
+    };
+    
+    if !is_relevant {
+      return;
+    }
+    
+    // Get parent record number from file name
+    let parent_record_number = file.get_best_file_name(&mft).map(|name| name.parent());
+    
+    // Get file size
     let size_bytes = file_info.size;
     let size_allocated_bytes = (size_bytes + 4095) & !4095;
     
-    // Get owner information
-    let owner_name = platform::get_path_owner(entry_path);
-    
-    // Ensure the processed_paths set is updated too
-    processed_paths.insert(entry_path.clone());
-    
-    analytics_map.insert(entry_path.clone(), Arc::new(AnalyticsInfo {
-      path: entry_path.clone(),
+    // Create the tree node
+    let node = TreeNode {
+      record_number,
+      parent_record_number,
+      path: file_info.path.clone(),
+      name: file_info.name,
+      is_directory,
       size_bytes,
       size_allocated_bytes,
-      entry_count,
-      file_count,
-      directory_count,
-      last_modified_time,
-      owner_name: owner_name.clone(),
-      path_info: Some(platform::PathInfo {
-        is_dir: file_info.is_directory,
-        is_file: !file_info.is_directory,
-        is_symlink: false,
-        size_bytes,
-        size_allocated_bytes,
-        inode_device: Some((0, file_info.size)),
-        times: (last_modified_time as i64, 0, 0),
-        owner_name,
-      }),
-    }));
+      entry_count: 1,
+      file_count: if is_directory { 0 } else { 1 },
+      directory_count: if is_directory { 1 } else { 0 },
+      last_modified_time: file_info.modified.map(|t| t.unix_timestamp() as u64).unwrap_or(0),
+      owner_name: platform::get_path_owner(&file_info.path),
+      children: Vec::new(),
+    };
+    
+    // Add the node to our collection
+    nodes.insert(record_number, node);
+    
+    // Mark the path as processed
+    processed_paths.insert(file_info.path);
   });
-
-  // The aggregation phase needs to respect the directory hierarchy (deepest first)
-  // Process directories in descending order of depth
-  for (entry_path, file_info) in sorted_entries {
-    if file_info.is_directory {
-      let mut total_size = file_info.size;
-      let mut total_allocated = (total_size + 4095) & !4095;
-      let mut total_entries = 1; // Start with the directory itself
-      let mut total_files = 0;
-      let mut total_dirs = 1; // Count this directory
+  
+  // Second pass: Link children to parents
+  // Use a temporary structure to collect parent-child relationships
+  let parent_child_pairs = Arc::new(DashMap::new());
+  
+  // First collect all parent-child relationships in parallel
+  nodes.par_iter().for_each(|entry| {
+    let record_number = *entry.key();
+    let node = entry.value();
+    
+    if let Some(parent_record) = node.parent_record_number {
+      parent_child_pairs.entry(parent_record)
+        .or_insert_with(Vec::new)
+        .push(record_number);
+    }
+  });
+  
+  // Then update parent nodes with their children
+  parent_child_pairs.into_par_iter().for_each(|entry| {
+    let parent_record = *entry.key();
+    let children = entry.value();
+    
+    if let Some(mut parent_node) = nodes.get_mut(&parent_record) {
+      parent_node.children.extend(children.iter());
+    }
+  });
+  
+  // Helper function to recursively compute sizes bottom-up
+  fn compute_sizes(
+    nodes: &DashMap<u64, TreeNode>,
+    record_number: u64,
+    analytics_map: &DashMap<PathBuf, Arc<AnalyticsInfo>>,
+    processed: &DashSet<u64>,
+  ) -> (u64, u64, u64, u64, u64) {
+    // Skip if already processed
+    if !processed.insert(record_number) {
+      return (0, 0, 0, 0, 0);
+    }
+    
+    // Get the node
+    if let Some(node) = nodes.get(&record_number) {
+      let base_size = node.size_bytes;
+      let base_allocated = node.size_allocated_bytes;
+      let base_entries = node.entry_count;
+      let base_files = node.file_count;
+      let base_dirs = node.directory_count;
       
-      // Sum up children using parallel reduction if there are enough children
-      if let Some(children) = parent_to_children.get(entry_path) {
-        let children_vec = children.value().clone();
-        
-        if children_vec.len() > 10 {
-          // Parallel reduction for larger directories
-          let (size, allocated, entries, files, dirs) = children_vec.par_iter()
-            .filter_map(|child_path| analytics_map.get(child_path).map(|a| a.clone()))
-            .fold(
-              || (0, 0, 0, 0, 0),
-              |(s, a, e, f, d), child_analytics| (
-                s + child_analytics.size_bytes,
-                a + child_analytics.size_allocated_bytes,
-                e + child_analytics.entry_count,
-                f + child_analytics.file_count,
-                d + child_analytics.directory_count,
-              )
+      // Process all children
+      let children = node.children.clone();
+      drop(node); // Release the reference before recursive calls
+      
+      // Use parallel processing for directories with many children
+      let (total_size, total_allocated, total_entries, total_files, total_dirs) = if children.len() > 10 {
+        // Parallel processing with Rayon
+        children.par_iter()
+          .map(|&child_record| compute_sizes(nodes, child_record, analytics_map, processed))
+          .reduce(
+            || (0, 0, 0, 0, 0),
+            |(s1, a1, e1, f1, d1), (s2, a2, e2, f2, d2)| (
+              s1 + s2,
+              a1 + a2,
+              e1 + e2,
+              f1 + f2,
+              d1 + d2,
             )
-            .reduce(
-              || (0, 0, 0, 0, 0),
-              |(s1, a1, e1, f1, d1), (s2, a2, e2, f2, d2)| (
-                s1 + s2,
-                a1 + a2,
-                e1 + e2,
-                f1 + f2,
-                d1 + d2,
-              )
-            );
-            
-          total_size += size;
-          total_allocated += allocated;
-          total_entries += entries;
-          total_files += files;
-          total_dirs += dirs;
-        } else {
-          // Sequential approach for smaller directories
-          for child_path in children_vec {
-            if let Some(child_analytics) = analytics_map.get(child_path) {
-              total_size += child_analytics.size_bytes;
-              total_allocated += child_analytics.size_allocated_bytes;
-              total_entries += child_analytics.entry_count;
-              total_files += child_analytics.file_count;
-              total_dirs += child_analytics.directory_count;
-            }
-          }
+          )
+      } else {
+        // Sequential processing for small directories
+        let mut size = 0;
+        let mut allocated = 0;
+        let mut entries = 0;
+        let mut files = 0;
+        let mut dirs = 0;
+        
+        for &child_record in &children {
+          let (s, a, e, f, d) = compute_sizes(nodes, child_record, analytics_map, processed);
+          size += s;
+          allocated += a;
+          entries += e;
+          files += f;
+          dirs += d;
         }
+        
+        (size, allocated, entries, files, dirs)
+      };
+      
+      let total_size = base_size + total_size;
+      let total_allocated = base_allocated + total_allocated;
+      let total_entries = base_entries + total_entries;
+      let total_files = base_files + total_files;
+      let total_dirs = base_dirs + total_dirs;
+      
+      // Update the node with aggregated values
+      if let Some(mut node) = nodes.get_mut(&record_number) {
+        node.size_bytes = total_size;
+        node.size_allocated_bytes = total_allocated;
+        node.entry_count = total_entries;
+        node.file_count = total_files;
+        node.directory_count = total_dirs;
+        
+        // Add to analytics map
+        let path_info = platform::PathInfo {
+          is_dir: node.is_directory,
+          is_file: !node.is_directory,
+          is_symlink: false,
+          size_bytes: total_size,
+          size_allocated_bytes: total_allocated,
+          inode_device: Some((0, record_number)), // Use record number as inode
+          times: (node.last_modified_time as i64, 0, 0),
+          owner_name: node.owner_name.clone(),
+        };
+        
+        analytics_map.insert(node.path.clone(), Arc::new(AnalyticsInfo {
+          path: node.path.clone(),
+          size_bytes: total_size,
+          size_allocated_bytes: total_allocated,
+          entry_count: total_entries,
+          file_count: total_files,
+          directory_count: total_dirs,
+          last_modified_time: node.last_modified_time,
+          owner_name: node.owner_name.clone(),
+          path_info: Some(path_info),
+        }));
       }
       
-      // Update directory entry with totals
-      if let Some(mut dir_analytics) = analytics_map.get_mut(entry_path) {
-        let analytics = Arc::make_mut(&mut dir_analytics);
-        analytics.size_bytes = total_size;
-        analytics.size_allocated_bytes = total_allocated;
-        analytics.entry_count = total_entries;
-        analytics.file_count = total_files;
-        analytics.directory_count = total_dirs;
-      }
+      return (total_size, total_allocated, total_entries, total_files, total_dirs);
+    }
+    
+    (0, 0, 0, 0, 0)
+  }
+  
+  // Find our target node's record number
+  let mut target_record = None;
+  for node_entry in nodes.iter() {
+    if node_entry.value().path == path {
+      target_record = Some(*node_entry.key());
+      break;
     }
   }
   
-  Ok(())
+  // If the target path was found in the MFT, compute sizes starting from there
+  if let Some(record) = target_record {
+    let processed = DashSet::new();
+    compute_sizes(&nodes, record, &analytics_map, &processed);
+    return Ok(());
+  }
+  
+  // If we didn't find the target path in MFT, fall back to traditional method
+  eprintln!("Path {:?} not found in MFT, falling back to traditional method", path);
+  
+  // We need to remove this path from processed_paths to ensure the traditional method processes it
+  processed_paths.remove(path);
+  
+  // Use the traditional calculation method for this path
+  calculate_size_traditional(path, analytics_map, target_dir_path, visited_inodes, processed_paths)
 }
 
 fn calculate_size_traditional(
