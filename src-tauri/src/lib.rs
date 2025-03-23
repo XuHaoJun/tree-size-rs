@@ -292,24 +292,32 @@ fn calculate_size_ntfs(
   // Use a temporary structure to collect parent-child relationships
   let parent_child_pairs = Arc::new(DashMap::new());
   
-  // First collect all parent-child relationships in parallel
-  nodes.par_iter().for_each(|entry| {
-    let record_number = *entry.key();
-    let node = entry.value();
-    
-    if let Some(parent_record) = node.parent_record_number {
-      parent_child_pairs.entry(parent_record)
+  // First collect all parent-child relationships
+  // DashMap doesn't directly support Rayon's parallel iteration, so use its own iter() method
+  let node_pairs: Vec<_> = nodes.iter().map(|entry| {
+    (
+      *entry.key(),
+      entry.value().parent_record_number
+    )
+  }).collect();
+  
+  // Now process these pairs in parallel using Rayon
+  node_pairs.par_iter().for_each(|(record_number, parent_record_opt)| {
+    if let Some(parent_record) = parent_record_opt {
+      parent_child_pairs.entry(*parent_record)
         .or_insert_with(Vec::new)
-        .push(record_number);
+        .push(*record_number);
     }
   });
   
   // Then update parent nodes with their children
-  parent_child_pairs.into_par_iter().for_each(|entry| {
-    let parent_record = *entry.key();
-    let children = entry.value();
-    
-    if let Some(mut parent_node) = nodes.get_mut(&parent_record) {
+  // Convert to Vec first to use Rayon's parallelism
+  let parent_records: Vec<_> = parent_child_pairs.iter()
+    .map(|entry| (*entry.key(), entry.value().clone()))
+    .collect();
+  
+  parent_records.par_iter().for_each(|(parent_record, children)| {
+    if let Some(mut parent_node) = nodes.get_mut(parent_record) {
       parent_node.children.extend(children.iter());
     }
   });
@@ -339,7 +347,10 @@ fn calculate_size_ntfs(
       drop(node); // Release the reference before recursive calls
       
       // Use parallel processing for directories with many children
-      let (total_size, total_allocated, total_entries, total_files, total_dirs) = if children.len() > 10 {
+      let (total_size, total_allocated, total_entries, total_files, total_dirs) = if children.is_empty() {
+        // No children, return zeros
+        (0, 0, 0, 0, 0)
+      } else if children.len() > 10 {
         // Parallel processing with Rayon
         children.par_iter()
           .map(|&child_record| compute_sizes(nodes, child_record, analytics_map, processed))
