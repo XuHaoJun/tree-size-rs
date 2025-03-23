@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 // Owner cache to avoid redundant lookups
 #[cfg(target_family = "unix")]
 lazy_static! {
-    static ref OWNER_CACHE: DashMap<u32, String> = DashMap::new();
+    static ref OWNER_CACHE: DashMap<String, String> = DashMap::new();
 }
 
 #[cfg(target_os = "windows")]
@@ -70,7 +70,7 @@ pub fn get_path_info<P: AsRef<Path>>(path: P, follow_links: bool) -> Option<Path
   let is_symlink = metadata.file_type().is_symlink();
 
   // Get the owner name
-  let owner_name = get_owner_name(path_ref, &metadata);
+  let owner_name = get_owner_name(path, &metadata);
 
   Some(PathInfo {
     size_bytes,
@@ -338,29 +338,30 @@ pub fn get_space_info<P: AsRef<Path>>(path: P) -> Option<(u64, u64, u64)> {
 }
 
 #[cfg(target_family = "unix")]
-fn get_owner_name<P: AsRef<Path>>(_path: P, metadata: &std::fs::Metadata) -> Option<String> {
+fn get_owner_name<P: AsRef<Path>>(path: P, metadata: &std::fs::Metadata) -> Option<String> {
   use std::os::unix::fs::MetadataExt;
   use users::get_user_by_uid;
 
-  let uid = metadata.uid();
+  let path_str = path.as_ref().to_string_lossy().into_owned();
   
-  // Check if the UID is already in the cache
-  if let Some(cached) = OWNER_CACHE.get(&uid) {
+  // Check if the path is already in the cache
+  if let Some(cached) = OWNER_CACHE.get(&path_str) {
     return Some(cached.clone());
   }
   
   // If not in cache, perform the lookup
+  let uid = metadata.uid();
   let name = match get_user_by_uid(uid) {
     Some(user) => {
       let name = user.name().to_string_lossy().into_owned();
       // Add to cache
-      OWNER_CACHE.insert(uid, name.clone());
+      OWNER_CACHE.insert(path_str, name.clone());
       Some(name)
     },
     None => {
       let name = format!("<deleted user {}>", uid);
       // Add to cache
-      OWNER_CACHE.insert(uid, name.clone());
+      OWNER_CACHE.insert(path_str, name.clone());
       Some(name)
     },
   };
@@ -384,8 +385,15 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
     OWNER_SECURITY_INFORMATION, PSID,
   };
 
-  let path = path.as_ref();
-  let path_wide: Vec<u16> = path
+  let path_ref = path.as_ref();
+  let path_str = path_ref.to_string_lossy().into_owned();
+  
+  // Check if the path is already in the cache
+  if let Some(cached) = OWNER_CACHE.get(&path_str) {
+    return Some(cached.clone());
+  }
+  
+  let path_wide: Vec<u16> = path_ref
     .as_os_str()
     .encode_wide()
     .chain(std::iter::once(0))
@@ -433,44 +441,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       eprintln!("Owner SID is null");
       return None;
     }
-
-    // Convert SID to string for cache key
-    let mut sid_string_ptr: winapi::um::winnt::LPWSTR = std::ptr::null_mut();
-    if sddl::ConvertSidToStringSidW(owner, &mut sid_string_ptr) == 0 {
-      eprintln!("ConvertSidToStringSidW failed");
-      return None;
-    }
     
-    // Ensure proper cleanup of SID string
-    struct SidStrCleanup(*mut u16);
-    impl Drop for SidStrCleanup {
-      fn drop(&mut self) {
-        unsafe { LocalFree(self.0 as *mut c_void) };
-      }
-    }
-    let _sid_str_cleanup = SidStrCleanup(sid_string_ptr);
-    
-    // Convert to Rust string for cache key
-    let sid_string = {
-      let mut len = 0;
-      while unsafe { *sid_string_ptr.offset(len) } != 0 {
-        len += 1;
-      }
-      let slice = std::slice::from_raw_parts(sid_string_ptr, len as usize);
-      match OsString::from_wide(slice).into_string() {
-        Ok(s) => s,
-        Err(_) => {
-          eprintln!("Failed to convert SID to string");
-          return None;
-        }
-      }
-    };
-    
-    // Check cache first
-    if let Some(cached) = OWNER_CACHE.get(&sid_string) {
-      return Some(cached.clone());
-    }
-
     // Convert SID to name
     let mut name_size = 0;
     let mut domain_size = 0;
@@ -519,7 +490,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
         match name.into_string() {
           Ok(name_str) => {
             // Add to cache
-            OWNER_CACHE.insert(sid_string, name_str.clone());
+            OWNER_CACHE.insert(path_str, name_str.clone());
             Some(name_str)
           },
           Err(_) => {
@@ -531,7 +502,7 @@ fn get_owner_name<P: AsRef<Path>>(path: P, _metadata: &std::fs::Metadata) -> Opt
       t if t == SidTypeDeletedAccount => {
         let name = "<deleted account>".to_string();
         // Add to cache
-        OWNER_CACHE.insert(sid_string, name.clone());
+        OWNER_CACHE.insert(path_str, name.clone());
         Some(name)
       },
       _ => {
