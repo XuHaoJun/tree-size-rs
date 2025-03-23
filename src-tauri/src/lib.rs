@@ -210,11 +210,6 @@ fn calculate_size_ntfs(
       })
   };
 
-  // Define data structures for building the tree
-
-  // Maps MFT record numbers to tree node indices
-  let id_to_index = DashMap::new();
-  
   // Tree nodes containing file/directory information
   struct TreeNode {
     record_number: u64,
@@ -233,7 +228,7 @@ fn calculate_size_ntfs(
   }
   
   // Store tree nodes
-  let nodes = Arc::new(DashMap::new());
+  let nodes: Arc<DashMap<u64, TreeNode>> = Arc::new(DashMap::new());
   
   // Create a cache for path computations
   let mut path_cache = ntfs_reader::file_info::HashMapCache::default();
