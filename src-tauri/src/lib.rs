@@ -12,8 +12,10 @@ use std::sync::Mutex;
 use tauri::Emitter;
 
 /// Contains analytics information for a directory or file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct AnalyticsInfo {
+  /// Path to the file or directory
+  path: PathBuf,
   /// Total size in bytes
   size_bytes: u64,
   /// Total size in bytes on disk
@@ -25,29 +27,6 @@ struct AnalyticsInfo {
   /// Number of directories
   directory_count: u64,
   /// Last modified time (Unix timestamp in seconds)
-  last_modified_time: u64,
-  /// Owner of the file or directory
-  owner_name: Option<String>,
-  /// Path info
-  path_info: Option<PathInfo>,
-}
-
-/// Represents size information for a file or directory
-#[derive(Clone, Debug, Serialize)]
-struct FileSystemEntry {
-  /// Path to the file or directory
-  path: PathBuf,
-  /// Size in bytes
-  size_bytes: u64,
-  /// Size allocated on disk in bytes
-  size_allocated_bytes: u64,
-  /// Number of entries (files and directories)
-  entry_count: u64,
-  /// Number of files
-  file_count: u64,
-  /// Number of directories
-  directory_count: u64,
-  /// last modified time
   last_modified_time: u64,
   /// Owner of the file or directory
   owner_name: Option<String>,
@@ -137,6 +116,7 @@ fn calculate_size_sync(
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
+        path: path.to_path_buf(),
         size_bytes: path_info.size_bytes,
         size_allocated_bytes: path_info.size_allocated_bytes,
         entry_count,
@@ -241,32 +221,17 @@ fn calculate_size_sync(
   Ok(())
 }
 
-// This function converts the analytics map to a vector of FileSystemEntry objects
-fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<FileSystemEntry> {
+// This function converts the analytics map to a vector of AnalyticsInfo objects
+fn analytics_map_to_entries(map: &DashMap<PathBuf, Arc<AnalyticsInfo>>) -> Vec<Arc<AnalyticsInfo>> {
   map
     .iter()
-    .map(|item| {
-      let path = item.key();
-      let analytics = item.value();
-
-      FileSystemEntry {
-        path: path.clone(),
-        size_bytes: analytics.size_bytes,
-        size_allocated_bytes: analytics.size_allocated_bytes,
-        entry_count: analytics.entry_count,
-        file_count: analytics.file_count,
-        directory_count: analytics.directory_count,
-        last_modified_time: analytics.last_modified_time as u64,
-        owner_name: analytics.owner_name.clone(),
-        path_info: analytics.path_info.clone(),
-      }
-    })
+    .map(|item| item.value().clone()) // Just clone the Arc pointer, not the inner data
     .collect()
 }
 
 // This function builds a tree from the flat list of entries with a limited depth
 fn build_tree_from_entries_with_depth(
-  entries: &[FileSystemEntry],
+  entries: &[Arc<AnalyticsInfo>],
   root_path: &Path,
   max_depth: usize,
   // Whether to build a virtual directory node for the root path
@@ -284,7 +249,7 @@ fn build_tree_from_entries_with_depth(
   build_virtual_directory_node: bool,
 ) -> FileSystemTreeNode {
   // Create a map of path -> entry for quick lookups
-  let path_map: HashMap<PathBuf, &FileSystemEntry> = entries
+  let path_map: HashMap<PathBuf, &Arc<AnalyticsInfo>> = entries
     .iter()
     .map(|entry| (entry.path.clone(), entry))
     .collect();
@@ -319,9 +284,9 @@ fn build_tree_from_entries_with_depth(
   // Recursive function to build the tree with depth limit
   fn build_node(
     path: &Path,
-    entry: &FileSystemEntry,
+    entry: &Arc<AnalyticsInfo>,
     children_map: &HashMap<PathBuf, Vec<PathBuf>>,
-    path_map: &HashMap<PathBuf, &FileSystemEntry>,
+    path_map: &HashMap<PathBuf, &Arc<AnalyticsInfo>>,
     current_depth: usize,
     max_depth: usize,
   ) -> FileSystemTreeNode {
@@ -514,7 +479,7 @@ fn build_tree_from_entries_with_depth(
 
 // This function builds a tree from prebuilt indices
 fn build_tree_from_indices(
-  entries: &[FileSystemEntry],
+  entries: &[Arc<AnalyticsInfo>],
   path_map: &HashMap<PathBuf, usize>,
   children_map: &HashMap<PathBuf, Vec<usize>>,
   target_path: &Path,
@@ -533,8 +498,8 @@ fn build_tree_from_indices(
   // Recursive function to build the tree starting from the target
   fn build_node(
     path: &Path,
-    entry: &FileSystemEntry,
-    entries: &[FileSystemEntry],
+    entry: &Arc<AnalyticsInfo>,
+    entries: &[Arc<AnalyticsInfo>],
     children_indices: Option<&Vec<usize>>,
     current_depth: usize,
     max_depth: usize,
@@ -763,7 +728,7 @@ lazy_static! {
 // Structure to hold cached scan data
 struct ScanCache {
   root_path: PathBuf,
-  entries: Vec<FileSystemEntry>,
+  entries: Vec<Arc<AnalyticsInfo>>,
   // Prebuilt indices for faster tree building
   path_map: HashMap<PathBuf, usize>, // Maps path to index in entries
   children_map: HashMap<PathBuf, Vec<usize>>, // Maps parent path to indices of children in entries
@@ -895,7 +860,7 @@ async fn scan_directory_complete(path: String, window: tauri::Window) -> std::io
 
 // Function to build indices for faster tree building
 fn build_indices(
-  entries: &[FileSystemEntry],
+  entries: &[Arc<AnalyticsInfo>],
   target_dir: &Path,
 ) -> (HashMap<PathBuf, usize>, HashMap<PathBuf, Vec<usize>>) {
   // First pass: build path_map (map from path to index in entries) - parallelize this
