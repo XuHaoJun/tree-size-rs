@@ -133,15 +133,15 @@ fn calculate_size_sync(
   };
 
   // Add entry to analytics map with initial values (will be updated later for directories)
-  let entry_analytics = match analytics_map.entry(path.to_path_buf()) {
+  let _entry_analytics = match analytics_map.entry(path.to_path_buf()) {
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
         size_bytes: path_info.size_bytes,
         size_allocated_bytes: path_info.size_allocated_bytes,
-        entry_count: entry_count,
-        file_count: file_count,
-        directory_count: directory_count,
+        entry_count,
+        file_count,
+        directory_count,
         last_modified_time: path_info.times.0 as u64,
         owner_name: path_info.owner_name.clone(),
         path_info: Some(path_info.clone()),
