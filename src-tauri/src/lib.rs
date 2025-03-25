@@ -73,8 +73,407 @@ struct DirectoryScanResult {
   scan_time_ms: u64,
 }
 
-// Efficient sync function that uses Rayon for parallel processing
+// Windows-specific NTFS implementation
+#[cfg(target_os = "windows")]
+mod ntfs_optimization {
+  use super::*;
+  use std::ffi::OsString;
+  use std::fs::OpenOptions;
+  use std::io::{BufReader, Read, Seek};
+  use std::os::windows::ffi::OsStringExt;
+  use std::path::{Path, PathBuf};
+  use std::sync::Arc;
+
+  /// Try to calculate directory size using direct NTFS file system access
+  /// Returns Ok(true) if successful, Ok(false) if NTFS optimization couldn't be used
+  pub fn calculate_size_ntfs(
+    path: &Path,
+    analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+    target_dir_path: &Path,
+    visited_inodes: Arc<DashSet<(u64, u64)>>,
+    processed_paths: Arc<DashSet<PathBuf>>,
+  ) -> std::io::Result<bool> {
+    // Only attempt NTFS optimization on the root directory of the scan
+    if path != target_dir_path {
+      return Ok(false);
+    }
+
+    // Get volume path from the target path
+    let volume_path = match get_volume_path(path) {
+      Some(vp) => vp,
+      None => return Ok(false), // Not a valid volume path
+    };
+
+    // Open the volume directly (requires admin privileges)
+    let volume_handle_path = format!(r"\\.\{}:", volume_path.chars().next().unwrap());
+    let volume_file = match OpenOptions::new().read(true).open(volume_handle_path) {
+      Ok(f) => f,
+      Err(_) => return Ok(false), // Couldn't open volume directly, fall back to standard method
+    };
+
+    // We need to wrap the file with a sector reader to ensure proper sector alignment
+    // Implementation adapted from ntfs-shell example
+    struct SectorReader<T> {
+      inner: T,
+      sector_size: usize,
+    }
+
+    impl<T: Read + Seek> SectorReader<T> {
+      fn new(inner: T, sector_size: usize) -> Self {
+        Self { inner, sector_size }
+      }
+    }
+
+    impl<T: Read + Seek> Read for SectorReader<T> {
+      fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+      }
+    }
+
+    impl<T: Read + Seek> Seek for SectorReader<T> {
+      fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+      }
+    }
+
+    let sector_reader = SectorReader::new(volume_file, 4096);
+    let mut fs = BufReader::new(sector_reader);
+
+    // Initialize NTFS object
+    let mut ntfs = match ntfs::Ntfs::new(&mut fs) {
+      Ok(n) => n,
+      Err(_) => return Ok(false),
+    };
+
+    // Read the upcase table (needed for case-insensitive string comparison)
+    if let Err(_) = ntfs.read_upcase_table(&mut fs) {
+      return Ok(false);
+    }
+
+    // Get the NTFS root directory
+    let root_dir = match ntfs.root_directory(&mut fs) {
+      Ok(dir) => dir,
+      Err(_) => return Ok(false),
+    };
+
+    // Convert input path to a relative path from volume root
+    let rel_path = match path.strip_prefix(&volume_path) {
+      Ok(p) => p.to_path_buf(),
+      Err(_) => PathBuf::new(), // Root of volume
+    };
+
+    // Find the target directory by traversing from root
+    let target_file = if rel_path.as_os_str().is_empty() {
+      root_dir
+    } else {
+      match find_ntfs_file_by_path(&ntfs, &mut fs, &root_dir, &rel_path) {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+      }
+    };
+
+    // Process the directory recursively
+    if let Err(_) = process_ntfs_directory(
+      &ntfs,
+      &mut fs,
+      &target_file,
+      path,
+      analytics_map,
+      visited_inodes,
+      processed_paths,
+    ) {
+      return Ok(false);
+    }
+
+    // Successfully processed with NTFS optimization
+    Ok(true)
+  }
+
+  /// Extract volume path from a path (e.g., C:\ from C:\Users\Username)
+  fn get_volume_path(path: &Path) -> Option<PathBuf> {
+    if let Some(path_str) = path.to_str() {
+      if path_str.len() >= 2 && path_str.chars().nth(1) == Some(':') {
+        // Extract drive letter with colon (e.g., C:)
+        let drive = &path_str[0..2];
+        return Some(PathBuf::from(drive));
+      }
+    }
+    None
+  }
+
+  /// Find an NTFS file by path, relative to the root directory
+  fn find_ntfs_file_by_path<'n, T>(
+    ntfs: &'n ntfs::Ntfs,
+    fs: &mut T,
+    root_dir: &ntfs::NtfsFile<'n>,
+    rel_path: &Path,
+  ) -> Result<ntfs::NtfsFile<'n>, ntfs::error::NtfsError>
+  where
+    T: Read + Seek,
+  {
+    // Start from the root directory
+    let mut current_dir = root_dir.clone();
+
+    // Skip empty paths
+    if rel_path.as_os_str().is_empty() {
+      return Ok(current_dir);
+    }
+
+    // Process each path component
+    for component in rel_path.components() {
+      if let std::path::Component::Normal(name) = component {
+        // Get the name as a string
+        let name_str = match name.to_str() {
+          Some(s) => s,
+          None => return Err(ntfs::error::NtfsError::PathNotFound),
+        };
+
+        // Skip empty components
+        if name_str.is_empty() {
+          continue;
+        }
+
+        // Get directory index
+        let index = current_dir.directory_index(fs)?;
+        let mut entries = index.entries();
+        let mut found = false;
+
+        // Find the entry with matching name
+        while let Some(entry_result) = entries.next(fs) {
+          let entry = entry_result?;
+          if let Ok(file_name) = entry.key() {
+            // Compare file names (case-insensitive on Windows)
+            if file_name.name().eq_ignore_ascii_case(name_str) {
+              // Found the entry, get the file record
+              let file_ref = entry.file_reference();
+              current_dir = ntfs.file(fs, file_ref.file_record_number())?;
+              found = true;
+              break;
+            }
+          }
+        }
+
+        if !found {
+          return Err(ntfs::error::NtfsError::PathNotFound);
+        }
+      }
+    }
+
+    Ok(current_dir)
+  }
+
+  /// Process an NTFS directory recursively
+  fn process_ntfs_directory<'n, T>(
+    ntfs: &'n ntfs::Ntfs,
+    fs: &mut T,
+    dir: &ntfs::NtfsFile<'n>,
+    path: &Path,
+    analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+    visited_inodes: Arc<DashSet<(u64, u64)>>,
+    processed_paths: Arc<DashSet<PathBuf>>,
+  ) -> std::io::Result<()>
+  where
+    T: Read + Seek,
+  {
+    // Skip if already processed
+    if !processed_paths.insert(path.to_path_buf()) {
+      return Ok(());
+    }
+
+    // Verify this is a directory
+    if !dir.is_directory() {
+      return Ok(());
+    }
+
+    // Get standard information for timestamps
+    let std_info = match dir.info() {
+      Ok(info) => info,
+      Err(_) => return Ok(()),
+    };
+
+    // Use record and sequence numbers as inode pair to detect cycles
+    let record_num = dir.file_record_number();
+    let seq_num = dir.sequence_number() as u64;
+    let inode_pair = (record_num, seq_num);
+
+    // Check for cycles
+    if !visited_inodes.insert(inode_pair) {
+      return Ok(());
+    }
+
+    // Get directory index
+    let index = match dir.directory_index(fs) {
+      Ok(idx) => idx,
+      Err(_) => return Ok(()),
+    };
+
+    // Initial analytics values for the directory
+    let mut total_size: u64 = 0;
+    let mut total_allocated_size: u64 = 0;
+    let mut total_entries: u64 = 1; // Start with the directory itself
+    let mut total_files: u64 = 0;
+    let mut total_dirs: u64 = 1; // Count this directory
+
+    // Collect child entries
+    let mut entries = index.entries();
+    let mut child_paths = Vec::new();
+
+    while let Some(entry_result) = entries.next(fs) {
+      if let Ok(entry) = entry_result {
+        if let Ok(file_name) = entry.key() {
+          let name = file_name.name().to_string();
+
+          // Skip . and .. entries
+          if name == "." || name == ".." {
+            continue;
+          }
+
+          let child_path = path.join(&name);
+          let is_dir = file_name.is_directory();
+          let file_ref = entry.file_reference();
+
+          // Get file size information from the file_name attribute
+          let size_bytes = file_name.data_size();
+          let size_allocated_bytes = file_name.allocated_size();
+
+          // Add to our running totals
+          total_size += size_bytes;
+          total_allocated_size += size_allocated_bytes;
+          total_entries += 1;
+
+          if is_dir {
+            total_dirs += 1;
+          } else {
+            total_files += 1;
+          }
+
+          // Add analytics info for this child
+          let child_analytics = Arc::new(AnalyticsInfo {
+            path: child_path.clone(),
+            size_bytes,
+            size_allocated_bytes,
+            entry_count: 1,
+            file_count: if is_dir { 0 } else { 1 },
+            directory_count: if is_dir { 1 } else { 0 },
+            last_modified_time: std_info.modification_time().to_u64_seconds(),
+            owner_name: None, // Would require additional Windows API calls
+            path_info: None,
+          });
+
+          analytics_map.insert(child_path.clone(), child_analytics);
+
+          // For directories, we'll process them recursively
+          if is_dir {
+            child_paths.push((child_path, file_ref.file_record_number()));
+          }
+        }
+      }
+    }
+
+    // Process subdirectories in parallel using Rayon
+    child_paths.par_iter().for_each(|(child_path, record_num)| {
+      // Skip if already processed
+      if processed_paths.contains(child_path) {
+        return;
+      }
+
+      // Get the child file
+      if let Ok(child_file) = ntfs.file(fs, *record_num) {
+        let _ = process_ntfs_directory(
+          ntfs,
+          fs,
+          &child_file,
+          child_path,
+          analytics_map.clone(),
+          visited_inodes.clone(),
+          processed_paths.clone(),
+        );
+      }
+    });
+
+    // Compute total sizes from all children in the analytics map
+    // This ensures we capture results from both the parallel processing above
+    // and any previously processed entries
+    let mut total_child_size = 0;
+    let mut total_child_allocated_size = 0;
+    let mut total_child_entries = 0;
+    let mut total_child_files = 0;
+    let mut total_child_dirs = 0;
+
+    for child_path in &child_paths {
+      if let Some(child_analytics) = analytics_map.get(&child_path.0) {
+        total_child_size += child_analytics.size_bytes;
+        total_child_allocated_size += child_analytics.size_allocated_bytes;
+        total_child_entries += child_analytics.entry_count;
+        total_child_files += child_analytics.file_count;
+        total_child_dirs += child_analytics.directory_count;
+      }
+    }
+
+    // Create analytics entry for this directory with final totals
+    let dir_analytics = Arc::new(AnalyticsInfo {
+      path: path.to_path_buf(),
+      size_bytes: total_size + total_child_size,
+      size_allocated_bytes: total_allocated_size + total_child_allocated_size,
+      entry_count: total_entries + total_child_entries,
+      file_count: total_files + total_child_files,
+      directory_count: total_dirs + total_child_dirs,
+      last_modified_time: std_info.modification_time().to_u64_seconds(),
+      owner_name: None,
+      path_info: None,
+    });
+
+    analytics_map.insert(path.to_path_buf(), dir_analytics);
+
+    Ok(())
+  }
+}
+
+// Platform-agnostic wrapper for calculating directory size
+// This is the function called by all code paths
 fn calculate_size_sync(
+  path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+  target_dir_path: &Path,
+  visited_inodes: Arc<DashSet<(u64, u64)>>,
+  processed_paths: Arc<DashSet<PathBuf>>,
+) -> std::io::Result<()> {
+  // Windows-specific optimization path
+  #[cfg(target_os = "windows")]
+  {
+    // Try the NTFS-optimized path for the root directory
+    if path == target_dir_path {
+      match ntfs_optimization::calculate_size_ntfs(
+        path,
+        analytics_map.clone(),
+        target_dir_path,
+        visited_inodes.clone(),
+        processed_paths.clone(),
+      ) {
+        Ok(true) => {
+          // Successfully used NTFS optimization, we're done!
+          return Ok(());
+        }
+        _ => {
+          // NTFS optimization failed, fall back to standard method
+          // Just continue to the standard method below
+        }
+      }
+    }
+  }
+
+  // Standard method for all platforms
+  calculate_size_std(
+    path,
+    analytics_map,
+    target_dir_path,
+    visited_inodes,
+    processed_paths,
+  )
+}
+
+// Standard method implementation (works on all platforms)
+fn calculate_size_std(
   path: &Path,
   analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
   target_dir_path: &Path,
@@ -94,7 +493,6 @@ fn calculate_size_sync(
   };
 
   // Check for cycles using device and inode numbers if available
-  // This handles both directory cycles AND symlinks properly
   if let Some(inode_pair) = path_info.inode_device {
     if !visited_inodes.insert(inode_pair) {
       // We've already seen this inode, skip it
