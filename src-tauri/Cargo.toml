@@ -41,6 +41,8 @@ sysinfo = { version = "0.33.1", features = ["disk"] }
 rayon = "1"
 dirs = "6"
 lazy_static = "1"
+ntfs = "0.4.0"
+winapi = { version = "0.3", features = ["fileapi", "winnt"] }
 
 [target.'cfg(unix)'.dependencies]
 users = "0.11"
