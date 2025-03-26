@@ -372,6 +372,7 @@ fn process_ntfs_path(
     dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
     dashmap::mapref::entry::Entry::Vacant(e) => {
       let analytics = Arc::new(AnalyticsInfo {
+        path: full_path.to_path_buf(),
         size_bytes: data_size as u64, // Convert u32 to u64
         size_allocated_bytes: allocated_size as u64, // Convert u32 to u64
         entry_count,
