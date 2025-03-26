@@ -1,4 +1,5 @@
 mod platform;
+mod sector_reader;
 
 use dashmap::{DashMap, DashSet};
 use lazy_static::lazy_static;
@@ -10,6 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::Emitter;
+use std::fs::File;
+use ntfs::Ntfs;
+use ntfs::indexes::NtfsFileNameIndex;
+use std::time::SystemTime;
+use std::io::{BufReader, Read, Seek, Write};
 
 /// Contains analytics information for a directory or file
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +79,401 @@ struct DirectoryScanResult {
   scan_time_ms: u64,
 }
 
+// Function to detect if a path is on an NTFS volume
+#[cfg(target_os = "windows")]
+fn is_ntfs_volume(path: &Path) -> bool {
+  use std::ffi::OsString;
+  use std::os::windows::ffi::OsStringExt;
+  use winapi::um::fileapi::{GetVolumeInformationW, GetVolumePathNameW};
+  use winapi::shared::minwindef::MAX_PATH;
+  
+  // First get the volume path
+  let path_str = path.to_string_lossy().to_string();
+  let mut path_wide: Vec<u16> = path_str.encode_utf16().collect();
+  path_wide.push(0); // null terminator
+  
+  let mut volume_path_wide = vec![0u16; MAX_PATH as usize];
+  
+  // Get volume path name
+  let success = unsafe {
+    GetVolumePathNameW(
+      path_wide.as_ptr(),
+      volume_path_wide.as_mut_ptr(),
+      volume_path_wide.len() as u32,
+    ) != 0
+  };
+  
+  if !success {
+    return false;
+  }
+  
+  // Get filesystem type
+  let mut fs_name_wide = vec![0u16; MAX_PATH as usize];
+  let mut volume_serial = 0;
+  let mut max_component_len = 0;
+  let mut fs_flags = 0;
+  
+  let success = unsafe {
+    GetVolumeInformationW(
+      volume_path_wide.as_ptr(),
+      std::ptr::null_mut(),
+      0,
+      &mut volume_serial,
+      &mut max_component_len,
+      &mut fs_flags,
+      fs_name_wide.as_mut_ptr(),
+      fs_name_wide.len() as u32,
+    ) != 0
+  };
+  
+  if !success {
+    return false;
+  }
+  
+  // Find the null terminator
+  let len = fs_name_wide.iter().position(|&c| c == 0).unwrap_or(fs_name_wide.len());
+  let fs_name_wide = &fs_name_wide[..len];
+  
+  // Convert from wide string to OsString then to string
+  let fs_name = OsString::from_wide(fs_name_wide);
+  let fs_name = fs_name.to_string_lossy().to_uppercase();
+  
+  fs_name == "NTFS"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_ntfs_volume(_path: &Path) -> bool {
+  // NTFS detection not implemented for non-Windows platforms
+  false
+}
+
+// Function to calculate size using the NTFS crate
+fn calculate_size_ntfs(
+  path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+  target_dir_path: &Path,
+  visited_inodes: Arc<DashSet<(u64, u64)>>,
+  processed_paths: Arc<DashSet<PathBuf>>,
+) -> std::io::Result<()> {
+  // Determine the volume path from the input path
+  // let volume_path = {
+  //   let path_str = path.to_string_lossy().to_string();
+  //   if path_str.len() >= 2 && &path_str[1..3] == ":\\" {
+  //     // Extract drive letter (e.g., "C:")
+  //     // format!("{}:\\", &path_str[..1])
+  //     format!("C:\\")
+  //   } else {
+  //     // Not a valid Windows volume path
+  //     return Err(std::io::Error::new(
+  //       std::io::ErrorKind::InvalidInput,
+  //       "Not a valid Windows volume path",
+  //     ));
+  //   }
+  // };
+   let volume_path = "\\\\.\\C:";
+  
+  // Open the volume directly using ntfs crate
+  let mut file = match File::open(volume_path) {
+    Ok(f) => f,
+    Err(e) => {
+      eprintln!("Failed to open NTFS volume {}: {}", volume_path, e);
+      return Err(e);
+    }
+  };
+
+  let sr = sector_reader::SectorReader::new(file.try_clone()?, 4096)?;
+  let mut fs = BufReader::new(sr);
+  
+  // Initialize NTFS filesystem
+  let mut ntfs = match Ntfs::new(&mut fs) {
+    Ok(ntfs) => ntfs,
+    Err(e) => {
+      eprintln!("Failed to initialize NTFS filesystem: {}", e);
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("Failed to initialize NTFS: {}", e),
+      ));
+    }
+  };
+  ntfs.read_upcase_table(&mut fs)?;
+  // We need to convert the target path to an NTFS path
+  // First, remove the volume prefix from the path
+  let rel_path = if let Some(remainder) = path.to_string_lossy().strip_prefix(&volume_path) {
+    remainder.replace('\\', "/")
+  } else {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "Path is not on the target volume",
+    ));
+  };
+  
+  // Process the path recursively
+  process_ntfs_path(&ntfs, &mut file, &rel_path, path, analytics_map, target_dir_path, visited_inodes, processed_paths)
+}
+
+// Process a path within the NTFS filesystem
+fn process_ntfs_path(
+  ntfs: &Ntfs,
+  file: &mut File,
+  ntfs_path: &str,
+  full_path: &Path,
+  analytics_map: Arc<DashMap<PathBuf, Arc<AnalyticsInfo>>>,
+  target_dir_path: &Path,
+  visited_inodes: Arc<DashSet<(u64, u64)>>,
+  processed_paths: Arc<DashSet<PathBuf>>,
+) -> std::io::Result<()> {
+  // If we've already processed this path, skip it
+  if !processed_paths.insert(full_path.to_path_buf()) {
+    return Ok(());
+  }
+  
+  // First try to find the file by its path in the NTFS directory structure
+  let root_dir = match ntfs.root_directory(file) {
+    Ok(dir) => dir,
+    Err(e) => {
+      eprintln!("Failed to access NTFS root directory: {}", e);
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("Failed to access NTFS root directory: {}", e),
+      ));
+    }
+  };
+  
+  // Navigate to the specified path
+  let ntfs_file = if ntfs_path.is_empty() || ntfs_path == "/" {
+    // If the path is the root, use the root directory
+    root_dir
+  } else {
+    // Use the NTFS directory index to find the file
+    let index = match root_dir.directory_index(file) {
+      Ok(idx) => idx,
+      Err(e) => {
+        eprintln!("Failed to get root directory index: {}", e);
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::Other,
+          format!("Failed to get root directory index: {}", e),
+        ));
+      }
+    };
+    
+    // Create a finder for the index
+    let mut _finder = index.finder();
+    
+    // Path components for traversal
+    let components: Vec<&str> = ntfs_path.split('/').filter(|&c| !c.is_empty()).collect();
+    if components.is_empty() {
+      return Ok(());
+    }
+    
+    // Start from the root and navigate the path
+    let mut current_dir = root_dir;
+    let mut current_file = None;
+    
+    for (i, component) in components.iter().enumerate() {
+      let index = match current_dir.directory_index(file) {
+        Ok(idx) => idx,
+        Err(e) => {
+          eprintln!("Failed to get directory index: {}", e);
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to get directory index: {}", e),
+          ));
+        }
+      };
+      
+      let mut _finder = index.finder();
+      
+      match NtfsFileNameIndex::find(&mut _finder, ntfs, file, component) {
+        Some(Ok(entry)) => {
+          current_file = Some(entry.to_file(ntfs, file).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to convert entry to file: {}", e))
+          })?);
+          
+          // If this isn't the last component and it's a directory, update current_dir
+          if i < components.len() - 1 {
+            if let Some(ref f) = current_file {
+              if f.is_directory() {
+                current_dir = f.clone();
+              } else {
+                return Err(std::io::Error::new(
+                  std::io::ErrorKind::NotFound,
+                  format!("Path component {} is not a directory", component),
+                ));
+              }
+            }
+          }
+        }
+        Some(Err(e)) => {
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Error finding NTFS file: {}", e),
+          ));
+        }
+        None => {
+          return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Path component not found: {}", component),
+          ));
+        }
+      }
+    }
+    
+    match current_file {
+      Some(f) => f,
+      None => {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::NotFound,
+          "File not found in NTFS",
+        ));
+      }
+    }
+  };
+  
+  // Get NTFS file metadata
+  let record_number = ntfs_file.file_record_number();
+  let is_directory = ntfs_file.is_directory();
+  let data_size = ntfs_file.data_size();
+  let allocated_size = ntfs_file.allocated_size();
+  
+  // Use as inode identifier - NTFS record number and sequence number form a unique identifier
+  let inode_pair = (record_number, ntfs_file.sequence_number() as u64);
+  
+  // Check for cycles using inode pair
+  if !visited_inodes.insert(inode_pair) {
+    // Already seen this inode, skip
+    return Ok(());
+  }
+  
+  // Counting entry as file or directory
+  let entry_count = 1; // Count this file/directory as 1 entry
+  let file_count = if is_directory { 0 } else { 1 };
+  let directory_count = if is_directory { 1 } else { 0 };
+  
+  // Get last modified time from standard information attribute
+  let last_modified_time;
+  let mut owner_name = None;
+  
+  // Try to get standard information - this is safer than directly accessing attributes
+  // Just use current time since we can't get the NTFS time information easily
+  last_modified_time = SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or(std::time::Duration::from_secs(0))
+    .as_secs();
+  
+  // Check for Windows owner (placeholder - would require additional logic to extract from NTFS security descriptor)
+  // For now, use the same approach as in platform.rs
+  let path_info = platform::get_path_info(&full_path, false);
+  if let Some(info) = &path_info {
+    owner_name = info.owner_name.clone();
+  }
+  
+  // Add entry to analytics map with initial values
+  let _entry_analytics = match analytics_map.entry(full_path.to_path_buf()) {
+    dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
+    dashmap::mapref::entry::Entry::Vacant(e) => {
+      let analytics = Arc::new(AnalyticsInfo {
+        path: full_path.to_path_buf(),
+        size_bytes: data_size as u64, // Convert u32 to u64
+        size_allocated_bytes: allocated_size as u64, // Convert u32 to u64
+        entry_count,
+        file_count,
+        directory_count,
+        last_modified_time,
+        owner_name,
+        path_info,
+      });
+      e.insert(analytics.clone());
+      analytics
+    }
+  };
+  
+  // For directories, process all children
+  if is_directory {
+    // Get the directory index to iterate over children
+    let dir_index = match ntfs_file.directory_index(file) {
+      Ok(index) => index,
+      Err(e) => {
+        eprintln!("Failed to get directory index for {}: {}", full_path.display(), e);
+        return Ok(());
+      }
+    };
+    
+    // Collect all the child paths and process them
+    // First get all the children
+    let mut child_paths = Vec::new();
+    
+    // Process the index entries one by one
+    let mut index_iter = dir_index.entries(); 
+    while let Some(Ok(entry)) = index_iter.next(file) {
+      // Get the filename from the entry key
+      if let Some(Ok(file_name)) = entry.key() {
+        // Convert to String - handle possible error
+        if let Ok(name_str) = file_name.name().to_string() {
+          // Skip "." and ".." entries
+          if name_str == "." || name_str == ".." {
+            continue;
+          }
+          
+          // Try to convert entry to file
+          if let Ok(_) = entry.to_file(ntfs, file) {
+            let child_path = full_path.join(&name_str);
+            let child_ntfs_path = if ntfs_path.is_empty() || ntfs_path == "/" {
+              format!("/{}", name_str)
+            } else {
+              format!("{}/{}", ntfs_path, name_str)
+            };
+            
+            // Process the child recursively
+            let _ = process_ntfs_path(
+              ntfs,
+              file,
+              &child_ntfs_path,
+              &child_path,
+              analytics_map.clone(),
+              target_dir_path,
+              visited_inodes.clone(),
+              processed_paths.clone(),
+            );
+            
+            // Add to our list of processed paths
+            child_paths.push(child_path);
+          }
+        }
+      }
+    }
+    
+    // Now recompute directory totals based on children
+    let mut total_size = data_size as u64;
+    let mut total_allocated_size = allocated_size as u64;
+    let mut total_entries = 1;
+    let mut total_files = 0;
+    let mut total_dirs = 1;
+    
+    // Sum up all children's contributions
+    for child_path in &child_paths {
+      if let Some(child_analytics) = analytics_map.get(child_path) {
+        total_size += child_analytics.size_bytes;
+        total_allocated_size += child_analytics.size_allocated_bytes;
+        total_entries += child_analytics.entry_count;
+        total_files += child_analytics.file_count;
+        total_dirs += child_analytics.directory_count;
+      }
+    }
+    
+    // Update the directory's analytics information
+    if let Some(mut analytics_ref) = analytics_map.get_mut(&full_path.to_path_buf()) {
+      let analytics = Arc::make_mut(&mut analytics_ref);
+      analytics.size_bytes = total_size;
+      analytics.size_allocated_bytes = total_allocated_size;
+      analytics.entry_count = total_entries;
+      analytics.file_count = total_files;
+      analytics.directory_count = total_dirs;
+    }
+  }
+  
+  Ok(())
+}
+
 // Efficient sync function that uses Rayon for parallel processing
 fn calculate_size_sync(
   path: &Path,
@@ -81,6 +482,18 @@ fn calculate_size_sync(
   visited_inodes: Arc<DashSet<(u64, u64)>>,
   processed_paths: Arc<DashSet<PathBuf>>,
 ) -> std::io::Result<()> {
+  // Check if the path is on an NTFS volume and use optimized NTFS calculation if possible
+  #[cfg(target_os = "windows")]
+  if is_ntfs_volume(path) {
+    match calculate_size_ntfs(path, analytics_map.clone(), target_dir_path, visited_inodes.clone(), processed_paths.clone()) {
+      Ok(_) => return Ok(()),
+      Err(e) => {
+        eprintln!("NTFS optimization failed, falling back to standard method: {}", e);
+        // Fall through to standard calculation
+      }
+    }
+  }
+
   // If we've already processed this path, skip it
   if !processed_paths.insert(path.to_path_buf()) {
     return Ok(());
@@ -300,7 +713,7 @@ fn build_tree_from_entries_with_depth(
     // Get children for this path if we haven't reached max depth
     let mut children = Vec::new();
     if current_depth < max_depth {
-      if let Some(child_paths) = children_map.get(&entry.path) {
+      if let Some(child_paths) = children_map.get(path) {
         for child_path in child_paths {
           if let Some(child_entry) = path_map.get(child_path) {
             let child_node = build_node(
